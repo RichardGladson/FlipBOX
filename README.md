@@ -1,100 +1,74 @@
-# 🎮 Flip-Up
+# flipBOX 🎮
 
-**A modular handheld gaming console powered by ESP32.**
+**A handheld gaming platform powered by the ESP32.**
 
-Flip-Up is a compact handheld gaming console built around an ESP32 microcontroller, a 0.96-inch OLED display, and seven physical buttons. It features a central game launcher designed to make adding new games simple, modular, and developer-friendly.
+flipBOX is an ESP32-based handheld gaming project featuring a monochrome OLED display, physical controls, and a modular game system. It is designed to run lightweight arcade games directly on the device.
 
-Rather than hardcoding every game into a single monolithic program, Flip-Up uses a launcher-based architecture that allows individual games to be developed as separate C++ source files.
+## 📄 Game Development Documentation
 
-## ✨ Features
+Two reference documents define how games are developed and integrated into flipBOX.
 
-* **ESP32-powered:** A compact embedded gaming platform.
-* **0.96-inch OLED display:** A small monochrome display for the launcher and games.
-* **Seven-button controls:** Physical input for navigating menus and playing games.
-* **Centralized game launcher:** `main.cpp` manages the launcher and provides the entry point for the gaming experience.
-* **Modular game architecture:** Games are implemented as separate C++ source files.
-* **Simple game integration:** Register a new game in the launcher's game list and add its source file to the `src` directory.
-* **Documented game interface:** A Markdown development guide describes the required C++ format for creating compatible games.
+| Document                            | Description                                                                                                                               |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `flipBOX_GAME_DEVELOPMENT_GUIDE.md` | Technical reference for hardware, controls, rendering, performance, game architecture, integration, and troubleshooting.                  |
+| `flipBOX_AI_GAME_SPEC.md`           | AI-facing specification covering game implementation requirements, development rules, deliverables, and a reusable game request template. |
 
-## 🕹️ How It Works
+**When developing games:**
 
-Flip-Up separates the launcher from individual game implementations.
+* **Manual development:** Use `flipBOX_GAME_DEVELOPMENT_GUIDE.md` as the technical reference.
+* **AI-assisted development:** Provide `flipBOX_AI_GAME_SPEC.md` alongside your specific game requirements.
 
-### The launcher
+## 🛠️ Hardware & Platform
 
-The main launcher is handled by `main.cpp`. It manages the launcher functionality and maintains the list of available games.
+* **Microcontroller:** ESP32-WROOM-32
+* **Display:** 128 × 64 monochrome OLED
+* **Display library:** U8g2
+* **Controls:** Six-button input layout
+* **Framework:** Arduino
+* **Build system:** PlatformIO
+* **Target CPU frequency:** 240 MHz
 
-### Individual games
+## 🕹️ Game System
 
-Each game is implemented separately using the C++ structure defined by the project's game development guide. This keeps individual game logic independent of the launcher implementation.
+flipBOX is intended to support multiple games through a modular architecture, allowing individual games to be developed separately and integrated into the main launcher.
 
-### Adding games
+Each game should follow the shared game interface and input, rendering, and performance requirements described in the development documentation.
 
-The launcher is designed to be extended without rewriting the entire firmware for every new game.
+### Planned Games
 
-To integrate a game:
+* **F1 Racing** — A pseudo-3D racing game featuring perspective, track bends, and player-controlled movement.
+* **Street Racing** — A two-car racing experience inspired by arcade street-racing games.
+* **Tokyo Drift** — A drifting-focused driving game concept.
 
-1. Create a C++ source file that follows the required game format.
-2. Place the source file in the project's `src` directory.
-3. Register the game in the list maintained by `main.cpp`.
-4. Build and flash the firmware to the ESP32.
+Game availability depends on implementation and integration progress.
 
-The launcher can then include the newly registered game in its available games.
+## 💻 Development Setup
 
-## 🛠️ Creating a Game
+1. Install [Visual Studio Code](https://code.visualstudio.com/).
+2. Install the [PlatformIO IDE extension](https://platformio.org/install/ide?install=vscode).
+3. Clone or download the flipBOX repository.
+4. Open the project folder in Visual Studio Code.
+5. Review `platformio.ini` and verify the configured board, framework, and dependencies.
+6. Build the firmware using PlatformIO.
+7. Connect the ESP32 and upload the firmware.
 
-Flip-Up includes a Markdown guide explaining how to implement games compatible with its launcher.
+## ⚙️ Development Principles
 
-Use that document as the reference for the required C++ structure, game interface, and integration process.
+* Run games directly on the ESP32 without requiring a phone or external application.
+* Keep game modules compatible with the shared launcher architecture.
+* Optimize rendering, memory usage, and frame rate for the hardware.
+* Use the established button layout and display configuration.
+* Keep implementations self-contained and maintainable.
+* Follow `flipBOX_GAME_DEVELOPMENT_GUIDE.md` for integration requirements.
 
-**The intended workflow is simple:** write a game, add its source file, register it with the launcher, and build the firmware.
+## 📁 Project Documentation
 
-This modular approach makes it easier to experiment with new game mechanics, maintain existing games, and expand the console over time.
+Keep the following documentation alongside the project source:
 
-## 🔧 Hardware
+* `README.md` — Project overview and setup.
+* `flipBOX_GAME_DEVELOPMENT_GUIDE.md` — Technical game development reference.
+* `flipBOX_AI_GAME_SPEC.md` — AI game generation specification.
 
-| Component         | Specification          |
-| ----------------- | ---------------------- |
-| Microcontroller   | ESP32                  |
-| Display           | 0.96-inch OLED         |
-| Input             | Seven physical buttons |
-| Firmware          | C++                    |
-| Build environment | PlatformIO             |
+---
 
-## 📁 Project Structure
-
-```text
-Flip-Up/
-├── src/
-│   ├── main.cpp
-│   └── <game source files>.cpp
-├── <game development guide>.md
-└── platformio.ini
-```
-
-*The structure above illustrates the intended organization; consult the repository for the exact filenames and configuration.*
-
-## 🚀 Development
-
-Flip-Up is designed to be extended through its existing firmware architecture.
-
-To develop or modify the project:
-
-1. Clone the repository.
-2. Open the project in Visual Studio Code with the PlatformIO extension.
-3. Review `main.cpp` and the game development guide.
-4. Implement or modify a game using the documented interface.
-5. Register new games in the launcher's game list.
-6. Build the firmware and upload it to the ESP32.
-
-Ensure that any new game follows the project's documented interface so it integrates correctly with the launcher.
-
-## 🎯 Project Goal
-
-Flip-Up aims to make handheld embedded game development more accessible by combining a compact ESP32-based console with a modular, extensible software architecture.
-
-The goal is to make expanding the game library a straightforward development task rather than requiring changes throughout the firmware.
-
-## 📜 License
-
-See the repository for licensing information.
+**flipBOX — Pick up, power on, and play.**
