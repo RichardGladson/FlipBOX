@@ -11,7 +11,7 @@
 //   Title / menus : LEFT/RIGHT = choose, SELECT = confirm (acts on press),
 //                   hold SELECT 1 s = exit to launcher
 //   Mode select   : LEFT / RIGHT = CLASSIC / ROAD RAGE, SELECT = next
-//   Car select    : LEFT / RIGHT = choose car, SELECT = race
+//   Car select    : LEFT / RIGHT = choose car, SELECT = race, X = back to mode
 //   Countdown     : wait for GO!
 //                   Classic: touching UP before GO = false start
 //                   Road Rage: touching X before GO = false start
@@ -22,7 +22,7 @@
 //                   UP / DOWN = change lane
 //                   LEFT = N2O #1, RIGHT = N2O #2
 //                   SELECT = POWER SHIFT
-//   Results       : LEFT / RIGHT = choose, SELECT = restart / exit
+//   Results       : LEFT / RIGHT = choose, SELECT = menu / replay / exit
 //
 // Road Rage specifics:
 //   4 broader lanes (no skyline scenery). Player camera locked to the
@@ -825,6 +825,10 @@ fb::Status gameUpdate(const fb::Input& in, const fb::Frame& f) {
 
     case ST_SELECT:
       if ((in.pressed & fb::KEY_LEFT) || (in.pressed & fb::KEY_RIGHT)) gMenuCursor ^= 1;
+      if (in.pressed & fb::KEY_X) {
+        gState = ST_MODE;
+        gMenuCursor = (uint8_t)gMode;
+      }
       if (selTap) { gCar = gMenuCursor; resetRace(); gState = ST_COUNT; }
       break;
 
@@ -976,10 +980,21 @@ fb::Status gameUpdate(const fb::Input& in, const fb::Frame& f) {
     } break;
 
     case ST_RESULTS:
-      if ((in.pressed & fb::KEY_LEFT) || (in.pressed & fb::KEY_RIGHT)) gMenuCursor ^= 1;
+      if (in.pressed & fb::KEY_LEFT) {
+        if (gMenuCursor == 0) gMenuCursor = 2; else --gMenuCursor;
+      } else if (in.pressed & fb::KEY_RIGHT) {
+        gMenuCursor = (uint8_t)((gMenuCursor + 1) % 3);
+      }
       if (selTap) {
-        if (gMenuCursor == 0) { gState = ST_MODE; gMenuCursor = (uint8_t)gMode; }
-        else return fb::GAME_EXIT;
+        if (gMenuCursor == 0) {          // Back to menu
+          gState = ST_MODE;
+          gMenuCursor = (uint8_t)gMode;
+        } else if (gMenuCursor == 1) {   // Replay
+          resetRace();
+          gState = ST_COUNT;
+        } else {                         // Exit
+          return fb::GAME_EXIT;
+        }
       }
       break;
   }
@@ -1285,7 +1300,7 @@ void renderSelect(U8G2& d) {
     d.drawBox((u8g2_uint_t)(cx + 29), 51, 5, 5);
   }
   d.setFont(u8g2_font_5x7_tr);
-  drawCentered(d, 63, "L/R:CHOOSE  SEL:RACE");
+  drawCentered(d, 63, "L/R:CHOOSE  SEL:RACE  X:BACK");
 }
 
 void renderScene(U8G2& d, bool hud) {
@@ -1556,10 +1571,15 @@ void renderCrash(U8G2& d) {
 void renderResults(U8G2& d) {
   char b[8];
   d.setFont(u8g2_font_7x13B_tr);
-  if (gCrashed)
-    drawCentered(d, 13, "CRASHED!");
-  else
-    drawCentered(d, 13, gWin ? "YOU WIN!" : "2ND PLACE");
+  if (gCrashed) {
+    drawCentered(d, 12, "YOU LOST");
+    d.setFont(u8g2_font_5x7_tr);
+    drawCentered(d, 22, "YOU WRECKED YOUR CAR");
+  } else if (gWin) {
+    drawCentered(d, 13, "YOU WIN!");
+  } else {
+    drawCentered(d, 13, "YOU LOST");
+  }
   d.setFont(u8g2_font_5x7_tr);
   if (gNewBest && !gCrashed && ((gAnimUs >> 17) & 1u)) drawCentered(d, 21, "NEW BEST!");
 
@@ -1592,9 +1612,14 @@ void renderResults(U8G2& d) {
     d.drawStr(26, 52, "---");
   }
 
-  d.drawStr(22, 62, "RESTART");
-  d.drawStr(84, 62, "EXIT");
-  d.drawStr(gMenuCursor == 0 ? 14 : 76, 62, ">");
+  // Three options: MENU | REPLAY | EXIT
+  d.drawStr(8, 62, "MENU");
+  d.drawStr(48, 62, "REPLAY");
+  d.drawStr(96, 62, "EXIT");
+  // Cursor indicator
+  if (gMenuCursor == 0)      d.drawStr(2, 62, ">");
+  else if (gMenuCursor == 1) d.drawStr(42, 62, ">");
+  else                       d.drawStr(90, 62, ">");
 }
 
 void renderExitCue(U8G2& d) {

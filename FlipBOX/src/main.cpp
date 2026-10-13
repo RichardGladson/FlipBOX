@@ -117,8 +117,8 @@
 #define FB_GAME_LIST(X)                                    \
   X(F1Racing,       "F1 Racing")                           \
   X(FastAndFurious, "Fast and Furious")                    \
-  X(TokyoDrift,     "Tokyo Drift")
-
+  X(TokyoDrift,     "Tokyo Drift") \
+  X(TwoFast2Furious, "2 Fast 2 Furious")
 // ============================================================================
 //  3. FLIPBOX GAME CONTRACT v1
 //     Paste everything between BEGIN and END, unchanged, at the top of every
