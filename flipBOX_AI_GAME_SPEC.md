@@ -1,7 +1,7 @@
 # flipBOX — AI Game Generation Specification
 
-**Document version:** 1.1 — matches `main.cpp` Wave 1 and **Game Contract v1** (with the X-button mask).
-**Purpose:** This is the AI-facing prompt and complete technical specification for generating one compatible flipBOX game. Provide this file to the AI along with the game request template at the end. It contains the required output format, implementation rules, hardware and launcher contract, and game-specific requirements.
+**Document version:** 1.2 — aligned to the supplied `main.cpp` Wave 1 and **Game Contract v1** (with the X-button mask), including asynchronous fast flush and late-latched input.
+**Purpose:** This is the AI-facing prompt and complete technical specification for generating one compatible flipBOX game. Provide this file to the AI along with the game request template at the end. It contains the required output format, implementation rules, hardware and launcher contract, and reusable game-generation requirements.
 
 ---
 
@@ -18,7 +18,7 @@ The original NyanBOX/jbohack assignments remain fixed, and the owner has added t
 | GND | GND | Common ground. |
 
 - I²C address: U8g2 default for this module (0x3C, i.e. 0x78 in 8-bit form).
-- Bus clock: 800 kHz by default (`FB_I2C_HZ`; lower to 400000 if the screen shows noise).
+- Bus clock: 1 MHz by default (`FB_I2C_HZ`; test lower settings if the screen shows noise).
 - OLED modules normally carry their own I²C pull-up resistors; none are added in software.
 - Reset pin: **not used** (`U8X8_PIN_NONE`).
 - U8g2 object: `U8G2_SSD1306_128X64_NONAME_F_HW_I2C gDisp(U8G2_R0, U8X8_PIN_NONE, /*SCL*/ 22, /*SDA*/ 21);`
@@ -142,9 +142,9 @@ The full pinout (display and all six buttons, with wiring diagram and certainty 
 platformio.ini            (do not modify)
 src/
   main.cpp                (the launcher — do not modify, except one registry line, §11)
-  Game1.cpp               (planned: F1 Racing)
-  Game2.cpp               (planned: Fast and Furious)
-  Game3.cpp               (planned: Tokyo Drift)
+  Game1.cpp               (planned: an example game)
+  Game2.cpp               (planned: an example game)
+  Game3.cpp               (planned: an example game)
   <AnyNewGame>.cpp        (future games)
 ```
 PlatformIO compiles **every** `.cpp` in `src/` automatically and links them into one firmware. The only coupling between the launcher and a game is the contract in §5.
@@ -214,7 +214,7 @@ A game is launchable only if the symbol exists **and** its `update` and `render`
 
 Consequences:
 - FPS = bounded by `max(game work per frame, I²C transmit time)`, **not their sum**.
-- I²C transmit time for a full 1 KB frame is roughly **11–14 ms at 800 kHz** (≈ 70–85 FPS ceiling) and roughly **25–30 ms at 400 kHz** (≈ 35–40 FPS ceiling). Treat these as estimates.
+- I²C transmit time for a full 1 KB frame is roughly **9–14 ms at 1 MHz**, depending on transfer overhead and module behaviour. These are estimates, not guarantees; measure on the actual hardware. Treat these as estimates.
 - **Roughly the first ~10 ms of `update()+render()` per frame is "free"** (hidden behind the transfer). Beyond that, every extra millisecond lowers FPS.
 - The frame you draw appears on the glass roughly one transfer later; that is normal.
 
@@ -311,7 +311,7 @@ For each game session: `init()` → (`update()` → `render()`) repeated → fin
 `FB_GAME(id, initFn, updateFn, renderFn, shutdownFn);` defines the exported symbol `fbGame_<id>`. It goes **at global scope**, as the **last line** of the file, **outside** any anonymous namespace (the functions it points to MAY be inside the anonymous namespace). Pass `nullptr` for `initFn` / `shutdownFn` if unused. Example shape:
 
 ```cpp
-FB_GAME(F1Racing, gameInit, gameUpdate, gameRender, nullptr);
+FB_GAME(an example game, gameInit, gameUpdate, gameRender, nullptr);
 ```
 
 ---
@@ -321,8 +321,8 @@ FB_GAME(F1Racing, gameInit, gameUpdate, gameRender, nullptr);
 ### 6.1 Properties
 - Six buttons: masks `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_SELECT`, `KEY_X` (bits 0–5). `KEY_X` is the physical button wired to D4 / ESP32 GPIO4, not GPIO8.
 - Read straight from the GPIO input registers once per loop iteration, immediately before `update()`. Reading costs well under a microsecond.
-- **Zero-latency debounce:** the first edge of a button is accepted immediately; further changes of the *same* button are ignored for **8 ms** (swallows contact bounce). So there is no added input lag.
-- Input is polled once per iteration, so `pressed`/`released` are the edges since the previous `update()`. A press-and-release both shorter than one whole frame could in theory be lost at very low frame rates; real button presses (≥ ~30 ms) are fine at any realistic FPS. Keep games well above ~30 FPS.
+- **Edge-latched debounce:** the first accepted edge is recorded immediately; subsequent changes of the same button are ignored for `FB_DEBOUNCE_US` (currently 5 ms) to suppress contact bounce. So there is no added input lag.
+- The launcher also samples inputs on a 1 ms `esp_timer` callback and latches accepted press/release edges between game updates, so short taps are less likely to be lost. `waitForLatch()` delays the game-frame start until close to the end of the current OLED transfer, allowing the next input sample to be fresher.
 - Multiple buttons can be held at once. Opposite directions (LEFT+RIGHT) can both be down; decide how the game resolves that.
 
 ### 6.2 Input gating (key blocking)
@@ -393,6 +393,20 @@ Use a tiny integer PRNG (e.g. xorshift32) stored in static state, seeded in `ini
 - The U8g2 draw functions clip to the screen, but clipped work is still work: do not draw things that are off-screen.
 - `U8G2` also supports `print`; prefer `drawStr` with a fixed `char` buffer filled by `snprintf` (no `String`, no `%f`).
 
+### 8.2.1 Rendering and responsiveness priorities
+The OLED transfer is often the throughput bottleneck, not game logic. Optimise in this order and verify each change with measurements:
+
+1. **Measure before tuning.** Build with `-DFB_SHOW_FPS=1`; compare `FB_I2C_HZ` at 400000, 800000 and 1000000 on the actual module. If FPS tracks bus speed, the link is the limit. Record FPS and screen stability rather than assuming a theoretical ceiling.
+2. **Keep the asynchronous fast flush enabled.** The current launcher already snapshots the full 1024-byte frame and streams it in chunks using a preconfigured horizontal-addressing window (`FB_ASYNC_DISPLAY=1`, `FB_FAST_FLUSH=1`). Do not reimplement or bypass this pipeline in a game. If you change chunk sizes, validate that the Wire buffer supports them and check for I²C errors or visual corruption.
+3. **Treat 1 MHz as a testable setting, not a universal guarantee.** OLED modules, pull-ups and wiring vary. Use short wires and adequate pull-ups; if noise, missing pixels or instability appears, reduce the clock (for example to 800 kHz or 400 kHz). Never trade correctness for a nominal FPS number.
+4. **Optimise drawing calls after the bus path is measured.** Avoid per-pixel `drawPixel()` loops for filled shapes. Prefer `drawBox`, `drawHLine`, `drawVLine`, spans, `drawXBM()` sprites and precomputed bitmaps. For repeated sprites, prepare the required orientations/scales in `init()` or compile-time data instead of rebuilding them pixel by pixel every frame.
+5. **Use direct buffer writes only for proven hot paths.** They can accelerate scanline fills, but bypass U8g2 clipping. Keep writes bounds-checked, follow the page layout in §8.3, and compare visual output against the normal primitives.
+6. **Sample input late; don't add frame waits.** The launcher already calls `waitForLatch()` before sampling input and updating/rendering, using measured work and transfer timing to reduce stale-input latency without intentionally capping throughput. Games must not add `delay()`, busy waits, or their own display synchronisation.
+7. **Make controls feel immediate.** Apply control changes on the first relevant update, avoid overly slow camera/steering easing, and use short input buffers where the game design benefits from them. Never discard a legitimate short press merely because an animation or cooldown is active unless that is an explicit gameplay rule.
+8. **Use real timestamps for timing-sensitive mechanics.** Optional launcher helpers `fb::keyPressedAtUs()`, `fb::frameStartUs()` and `fb::displayLatencyUs()` are declared in §4/launcher extras. If the game needs precise reaction timing, use press timestamps and account for display latency rather than measuring only frame counts. Declare these helper prototypes inside the game's own `namespace fb` block when used; do not modify the contract.
+9. **Tune CPU/compiler settings only after profiling.** The board is configured for high performance, but `-O2` (with `build_unflags = -Os`) should be tested against the actual build and memory use. Do not assume compiler flags will improve a bus-bound game.
+10. **Account for visual cadence.** Large world shifts per frame can look jumpy even at a high FPS. Use `dtUs`-based motion, suitable parallax speeds and spacing, and speed-dependent visual cues where appropriate.
+
 ### 8.3 Direct frame-buffer access (allowed, advanced, fast)
 For scanline-heavy rendering (pseudo-3D roads, scrolling terrain) `d.getBufferPtr()` returns the raw 1024-byte buffer. Layout:
 
@@ -437,8 +451,8 @@ Never call: `begin()`, `setBusClock()`, `setPowerSave()`, `setContrast()`, `setF
 3. **Precalculate reusable geometry** (road scanline projection tables, rotated car outlines for N angles, perspective curves, pre-scaled strips) once in `init()` or at compile time. Static `const` tables live in flash and are read through the cache; keep hot tables small.
 4. **No dynamic allocation.** No `new`/`malloc`/`String`/`std::` containers. Fixed arrays with compile-time sizes. No `static` objects with non-trivial constructors/destructors.
 5. **Memory budget (targets):** game static RAM ≲ 16 KB; flash ≲ 100–150 KB per game. Keep stack usage tiny (the loop task has 8 KB total, shared with the launcher and the U8g2 call chain). No large local arrays; make big arrays `static`.
-6. **Avoid full-screen work that isn't necessary.** Draw only what changes the picture; prefer `drawHLine`/`drawBox` spans over `drawPixel` loops; prefer direct buffer writes (§8.3) for scanline fills.
-7. **Keep `update()` + `render()` ≲ ~10 ms** where possible (free; hidden behind the I²C transfer — §4.4). Past that, each millisecond costs FPS.
+6. **Avoid expensive per-pixel rendering.** Prefer `drawHLine`/`drawVLine`/`drawBox`, spans, and precomputed `drawXBM()` sprites over `drawPixel()` loops. Use direct buffer writes (§8.3) for measured hot paths such as scanline fills, with strict bounds checks.
+7. **Keep `update()` + `render()` comfortably below the measured OLED transfer time** where possible; the asynchronous pipeline overlaps game work with I²C transmission. Work beyond the transfer window can lower FPS. Profile rather than treating any single millisecond threshold as universal.
 8. **Cheap per-frame text:** only re-format a number string when the number changes (cache the `char` buffer) if formatting shows up in profiling.
 9. **No `delay`, no waiting loops, no `yield()` games, no blocking I/O, no `Serial` in the final code.**
 10. **Branch/memory friendliness:** simple loops, small structs, arrays of structs for entities; avoid pointer chasing and virtual calls inside inner loops.
@@ -497,32 +511,17 @@ Whatever scheme is used, the on-screen text must tell the player how to leave. R
 5. **Only if the game is not already registered:** add one line to `FB_GAME_LIST` in `main.cpp`.
 6. Build. PlatformIO compiles and links the new file automatically; the launcher can then launch it.
 
-### 11.2 The registry in `main.cpp` (current content)
-```cpp
-#define FB_GAME_LIST(X)                                    \
-  X(F1Racing,       "F1 Racing")                           \
-  X(FastAndFurious, "Fast and Furious")                    \
-  X(TokyoDrift,     "Tokyo Drift")
-```
-| Menu entry | `<id>` used in `FB_GAME(...)` | Planned file | Resulting exported symbol |
-|---|---|---|---|
-| F1 Racing | `F1Racing` | `Game1.cpp` | `fbGame_F1Racing` |
-| Fast and Furious | `FastAndFurious` | `Game2.cpp` | `fbGame_FastAndFurious` |
-| Tokyo Drift | `TokyoDrift` | `Game3.cpp` | `fbGame_TokyoDrift` |
+### 11.2 Registering a new game
+The registry in `main.cpp` is the authoritative list of menu entries. Do not assume any particular game is already registered; inspect the supplied `main.cpp` when available.
 
-**These three are already registered.** Building one of them needs **no edit to `main.cpp`** — the file only has to export the right symbol.
-
-### 11.3 Adding a brand-new game (one registry line)
-Add one `X(<id>, "<Menu Label>")` line to `FB_GAME_LIST`. Every line except the last ends with a backslash `\`; when appending, **add a trailing `\` to the previous last line** and leave the new last line without one. Example:
+To add a game, add one `X(<id>, "<Menu Label>")` line to `FB_GAME_LIST`. Every line except the last ends with a backslash `\\`; when appending, add a trailing `\\` to the previous last line and leave the new last line without one. Example shape:
 
 ```cpp
-#define FB_GAME_LIST(X)                                    \
-  X(F1Racing,       "F1 Racing")                           \
-  X(FastAndFurious, "Fast and Furious")                    \
-  X(TokyoDrift,     "Tokyo Drift")                         \
-  X(NewGame,        "New Game")
+#define FB_GAME_LIST(X) \\
+  X(ExampleGame, "Example Game")
 ```
-Rules for `<id>`: a valid C identifier, unique, **exactly equal** (case-sensitive) to the `id` in `FB_GAME`. Rules for `"<Menu Label>"`: plain ASCII 32–127, **≤ 18 characters** (≤ 16 recommended — "Fast and Furious" is 16), unique and descriptive. The menu shows 3 rows at a time and scrolls (with a scroll bar) when there are more; entries are numbered 1–9 (further entries show `+`).
+
+Rules for `<id>`: a valid C identifier, unique, and exactly equal (case-sensitive) to the `id` in `FB_GAME(...)`. The menu label must be plain ASCII 32–127, at most 18 characters (16 or fewer recommended), unique and descriptive. The menu shows three rows at a time and scrolls when more entries exist.
 
 ### 11.4 Launcher behaviour you can rely on (the player-facing side)
 - Boots straight into the **flipBOX** game menu (no splash). Title "flipBOX" at the top, `n/m` counter at the right, list below, selected row drawn as an inverted bar.
@@ -540,51 +539,18 @@ Sound, if the owner wants it, is a **future wave** with a contract change — do
 
 ---
 
-## 13. THE THREE PLANNED GAMES (design constraints, verbatim intent)
-
-These three games are **completely different gameplay models**. The launcher and the contract deliberately make no assumption that games share mechanics. Never reuse one game's model for another.
-
-### 13.1 GAME 1 — F1 RACING (`F1Racing`, `Game1.cpp`)
-- Pseudo-3D racing; the road comes toward a mostly stationary player car.
-- Steering LEFT/RIGHT; **UP accelerates**; **DOWN brakes/decelerates**.
-- **No drifting.**
-- The road curves left/right.
-- Main challenges: **speed + steering accuracy + anticipation**.
-
-### 13.2 GAME 2 — FAST AND FURIOUS (`FastAndFurious`, `Game2.cpp`)
-- Straight-line **drag racing**, two cars.
-- The player chooses **Nissan Skyline GTR** or **Dodge Charger**.
-- **Skyline: higher acceleration. Charger: higher top speed.**
-- Timing, acceleration and **nitro** are the primary mechanics.
-- The **opponent operates independently**; **opponent speed MUST NOT depend on player speed**.
-- **Two independent nitro controls.** Each nitro gives **+30 km/h for 3 seconds**; both at once give **+60 km/h**.
-- Nitro is a **one-time switch** — it does **not** require the button to remain held.
-- **Both NO2 bars are visible** on screen.
-
-### 13.3 GAME 3 — TOKYO DRIFT (`TokyoDrift`, `Game3.cpp`)
-- **True top-down racing**, completely different from Game 1.
-- **Momentum-based arcade driving:** acceleration, steering, turning, inertia, lateral movement, **controlled drifting**.
-- **Pressing LEFT/RIGHT while pressing DOWN initiates a drift.**
-- Drifting must be **controllable and rewarding**.
-- The car remains **approximately centred** while the **world/track scrolls**.
-- The top-down car must be **clearly visible** and must **visually tilt during drifting**.
-
-(If the Game Request for one of these refines or overrides details, the Game Request wins, as long as hard rules in §1 are respected.)
-
----
-
-## 14. REQUIRED DELIVERABLE FORMAT (WHAT THE LLM MUST OUTPUT)
+## 13. REQUIRED DELIVERABLE FORMAT (WHAT THE LLM MUST OUTPUT)
 
 1. **A one-paragraph design summary:** the control scheme (which button does what on every screen, including how to exit), the game states/screens, the physics/rendering approach (time-based fixed-point, tables precomputed), and any assumptions made.
 2. **The complete file `src/<GameFile>.cpp`** in a single code block — complete, real, compilable, production-quality, with the contract block pasted verbatim at the top and the `FB_GAME` line at the end. No placeholders, no "rest of the code goes here", no pseudo-code.
 3. **Registry instruction:** either "already registered, no change to `main.cpp`" or the exact single line to add to `FB_GAME_LIST` (with the backslash adjustment).
 4. **A short tuning guide:** which constants at the top of the file change the feel (acceleration, top speed, steering, difficulty, etc.).
-5. **A short self-review** against §16 (a few lines, not a lecture), explicitly stating estimated static RAM and any known limitation.
+5. **A short self-review** against §15 (a few lines, not a lecture), explicitly stating estimated static RAM and any known limitation.
 6. Nothing else: no extra files, no other games, no changes to `main.cpp`/`platformio.ini`, no change to the contract.
 
 ---
 
-## 15. FILE SKELETON (STRUCTURE ONLY — NOT A GAME)
+## 14. FILE SKELETON (STRUCTURE ONLY — NOT A GAME)
 
 This shows the required shape. It contains **no gameplay**; replace the bodies. It will not let the player leave the game until an exit path is implemented (§10.3), which is mandatory.
 
@@ -642,7 +608,7 @@ FB_GAME(<id>, gameInit, gameUpdate, gameRender, gameShutdown);
 
 ---
 
-## 16. SELF-REVIEW CHECKLIST (the LLM must verify before answering)
+## 15. SELF-REVIEW CHECKLIST (the LLM must verify before answering)
 
 **Integration**
 - [ ] Contract block pasted verbatim, unmodified; `FB_GAME(...)` is the last line, at global scope.
@@ -679,7 +645,7 @@ FB_GAME(<id>, gameInit, gameUpdate, gameRender, gameShutdown);
 
 ---
 
-## 17. TROUBLESHOOTING (for the human, and for the LLM when fixing errors)
+## 16. TROUBLESHOOTING (for the human, and for the LLM when fixing errors)
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -698,7 +664,7 @@ FB_GAME(<id>, gameInit, gameUpdate, gameRender, gameShutdown);
 | FPS lower than expected | `update()+render()` > ~10 ms, per-pixel `drawPixel`, float trig, big fills | Optimise per §9; use spans/direct buffer writes/tables |
 | Text/graphics wrong after overlay | Relying on draw state across frames | Set font/colour/mode every `render()` |
 
-Owner-side build flags (optional, in `platformio.ini` `build_flags`): `-DFB_I2C_HZ=<hz>` (OLED bus clock, default 800000), `-DFB_ASYNC_DISPLAY=0|1` (default 1; 0 = plain synchronous `sendBuffer()`), `-DFB_SHOW_FPS=0|1` (default 0), `-DFB_DEBOUNCE_US=<µs>` (default 8000), `-DFB_MAX_DT_US=<µs>` (default 50000). A game must work correctly regardless of these. Optionally `-O2` (with `build_unflags = -Os`) for extra speed.
+Owner-side build flags (optional, in `platformio.ini` `build_flags`): `-DFB_I2C_HZ=<hz>` (OLED bus clock, default 1000000), `-DFB_ASYNC_DISPLAY=0|1` (default 1; 0 = plain synchronous `sendBuffer()`), `-DFB_FAST_FLUSH=0|1` (default 1; streamed I²C writes when async display is enabled), `-DFB_LATE_LATCH=0|1` (default 1), `-DFB_I2C_CHUNK=<bytes>` (default 256, reduced automatically if the Wire buffer cannot support it), `-DFB_SHOW_FPS=0|1` (default 0), `-DFB_DEBOUNCE_US=<µs>` (default 5000), `-DFB_MAX_DT_US=<µs>` (default 50000). A game must work correctly regardless of these. Optionally `-O2` (with `build_unflags = -Os`) for extra speed.
 
 ---
 
@@ -708,36 +674,17 @@ These are the exact launcher routines a game interacts with. Games do not copy o
 
 ### A.1 Options (defaults, all overridable by `-D`)
 ```cpp
-FB_I2C_HZ         800000UL   // OLED bus clock
+FB_I2C_HZ         1000000UL  // OLED bus clock
 FB_ASYNC_DISPLAY  1          // frame pushed to the OLED from core 0
 FB_SHOW_FPS       0          // debug FPS box (top-right) inside games
-FB_DEBOUNCE_US    8000UL     // per-key lock-out after an edge
+FB_DEBOUNCE_US    5000UL     // per-key lock-out after an edge
 FB_MAX_DT_US      50000UL    // clamp for Frame::dtUs
 ```
 
-### A.2 Input polling, debounce and gating
-```cpp
-// Buttons are active-low; readRaw() returns a mask of keys that are DOWN.
-inline void pollInput(uint32_t nowUs) {
-  const uint8_t prev = gStable;
-  const uint8_t diff = readRaw() ^ prev;
-  if (diff) {
-    for (uint8_t i = 0; i < kKeyCount; ++i) {
-      const uint8_t bit = (uint8_t)(1u << i);
-      if ((diff & bit) && (uint32_t)(nowUs - gChangeUs[i]) >= FB_DEBOUNCE_US) {
-        gStable ^= bit;          // first edge accepted immediately
-        gChangeUs[i] = nowUs;    // then locked out for FB_DEBOUNCE_US
-      }
-    }
-  }
-  const uint8_t cur        = gStable;
-  const uint8_t wasBlocked = gBlocked;
-  gBlocked &= cur;                                          // released -> unblocked
-  gIn.held     = (uint8_t)(cur & ~gBlocked);
-  gIn.pressed  = (uint8_t)((cur & ~prev) & ~gBlocked);
-  gIn.released = (uint8_t)((prev & ~cur) & ~wasBlocked);
-}
-```
+### A.2 Input sampling, debounce and gating
+The launcher samples active-LOW buttons directly from the GPIO input registers both during the game loop and from a 1 ms `esp_timer` callback. Accepted press/release edges are latched under a spinlock until `pollInput()` consumes them. The first edge is accepted immediately; later transitions on the same key are suppressed for `FB_DEBOUNCE_US`. Held keys are gated at boot, game entry and game exit until physically released.
+
+Games must use only the `fb::Input` supplied to `update()`. Never add a second GPIO reader or input task inside a game.
 
 ### A.3 Entering and leaving a game
 ```cpp
@@ -836,8 +783,8 @@ Paste this whole `.md` file first, then:
 ```
 GAME REQUEST
 - Game title / menu label:
-- Registry id (<id>):            (e.g. F1Racing — or "new: <id>")
-- File name:                     (e.g. Game1.cpp)
+- Registry id (<id>):            (e.g. ExampleGame — or "new: <id>")
+- File name:                     (e.g. ExampleGame.cpp)
 - Genre / camera / view:
 - Core gameplay & rules:
 - Controls (UP / DOWN / LEFT / RIGHT / SELECT on each screen):
@@ -850,7 +797,7 @@ GAME REQUEST
 - Anything else:
 
 Follow the flipBOX spec exactly. Deliver the one .cpp file in a single code block,
-the registry instruction, a short tuning guide and the self-review (§14).
+the registry instruction, a short tuning guide and the self-review (§15).
 Do not create any other game or file.
 ```
 
