@@ -6,9 +6,13 @@
 // the screen shows the road ahead, while the track scrolls AND rotates around
 // it: the camera looks along the car's MOMENTUM (velocity) direction, while
 // the car body shows the true heading, so drifts visibly tilt the car.
-// Large directional arrows are painted on the road surface itself and
-// move/rotate with the world (they are transformed with the exact same
-// world->camera transform as the road geometry).
+// Road cues are painted on the road surface itself and move/rotate with the
+// world (same world->camera transform as the road geometry): predictive
+// corner arrows lean toward the coming bend (left/right, stronger lean =
+// sharper corner) and dotted lines mark drift-initiation zones before suitable
+// corners. Both, and the HUD next-corner chevrons, are derived once per track
+// from the curvature table (analyseCorners), nothing is hard-coded per corner.
+// Road width depends on the track (wide = easy, narrow = expert).
 //
 // Screen layout: rows 0..kPlayH-1 are the playable/road area; the bottom
 // kHudH rows are one dedicated HUD strip (LAP | SPEED | TIME). World
@@ -19,7 +23,8 @@
 //   UP                  accelerate
 //   DOWN                brake / reverse (nothing else)
 //   LEFT / RIGHT        steer (smoothed, reduced sensitivity)
-//   X + LEFT/RIGHT      handbrake drift (needs some speed)
+//   X + LEFT/RIGHT      handbrake drift (needs speed; steering sets the angle,
+//                       countersteer / release to recover, big angles cost speed)
 //   SELECT              menus: confirm | race: pause
 //   LEFT (track menu)   back
 //   hold SELECT ~1 s    quit to launcher (anywhere, with progress bar)
@@ -98,8 +103,7 @@ constexpr uint8_t  kLaps          = 3;          // race length, laps
 constexpr int      kTrackMax      = 400;        // max centreline points (arrays)
 constexpr int      kTrackMin      = 96;         // min centreline points
 constexpr float    kSpacing       = 12.f;       // px between centreline points (uniform)
-constexpr int16_t  kRoadHalf      = 16;         // road half-width, px
-constexpr float    kWallLim       = 12.f;       // car-centre limit from the centreline, px (wheels touch the edge)
+constexpr float    kWallMargin    = 4.f;        // px: wall limit = road half-width - this (wheels touch the edge)
 constexpr float    kMaxSpeed      = 175.f;      // px/s, forward top speed
 constexpr float    kMaxReverse    = 45.f;       // px/s
 constexpr float    kAccel         = 150.f;      // px/s^2
@@ -115,6 +119,20 @@ constexpr float    kSteerRamp     = 6.0f;       // 1/s, steer input ramps toward
 constexpr float    kSteerRelax    = 10.0f;      // 1/s, steer input returns to centre
 constexpr float    kDriftSteerMul = 1.6f;       // steering boost while drifting
 constexpr float    kDriftMinSpeed = 45.f;       // px/s forward speed needed to drift
+constexpr float    kDriftSteerMin = 0.30f;      // steer (0..1) needed to START a drift
+constexpr float    kDriftHoldMin  = 0.12f;      // steer needed to keep one going
+constexpr float    kDriftKIn      = 9.0f;       // 1/s, drift intensity ramps in (~0.11 s)
+constexpr float    kDriftKOut     = 3.0f;       // 1/s, ...and out (~0.33 s): grip returns progressively
+constexpr float    kDriftKick     = 9.0f;       // brads, one-off yaw kick when X is pressed with steering
+constexpr float    kKickWindow    = 0.30f;      // s after pressing X in which steering still triggers the kick
+constexpr float    kSlipRef       = 40.f;       // brads, slip angle at which sideways grip has risen by kSlipGrip
+constexpr float    kSlipGrip      = 1.5f;       // extra grip factor at kSlipRef (squared): makes the angle self-limiting
+constexpr float    kSlipSweet     = 26.f;       // brads (~37 deg): beyond this the penalty grows steeply
+constexpr float    kSlipMax       = 50.f;       // brads (~70 deg): from here sideways motion is fully penalised
+constexpr float    kSlipScrub     = 1.0f;       // 1/s speed loss at kSlipMax (scaled by drift intensity)
+constexpr float    kSlipBase      = 0.65f;      // 1/s speed loss at the sweet-spot angle: a drift is never free, it must be earned
+constexpr float    kCounterBoost  = 1.15f;       // steering authority bonus when countersteering a slide
+constexpr float    kDeepSteerCut  = 0.5f;       // steering authority loss when pushing deeper into a big angle
 constexpr float    kWallLoss      = 0.5f;       // max one-off tangential speed loss on a hard wall hit
 constexpr float    kWallDrag      = 1.8f;       // 1/s, scrape drag while touching the wall
 constexpr float    kWallAlign     = 90.f;       // brads/s, nose turns along the wall while sliding
@@ -131,7 +149,21 @@ constexpr uint32_t kCdStepUs      = 700000UL;   // countdown step (3,2,1,GO)
 constexpr int      kVisBack       = 8;          // centreline points drawn behind car
 constexpr int      kVisFwd        = 30;         // ... and ahead of the car
 constexpr int      kVisN          = kVisBack + kVisFwd;
-constexpr int      kArrowEvery    = 10;         // one road arrow per N points
+constexpr int      kCornerMax     = 48;         // max corners tracked per track
+constexpr int      kCorOn         = 14;         // |gTCur| (brads) at which a bend starts
+constexpr int      kCorOff        = 8;          // ... and ends (hysteresis)
+constexpr int      kCorMinTurn    = 20;         // brads (~28 deg): smaller bends are not "significant corners"
+constexpr int      kSevMed        = 34;         // apex |gTCur| >= this = medium (radius ~85 px)
+constexpr int      kSevSharp      = 52;         // ... >= this = sharp (radius ~55 px)
+constexpr int      kArrowLead     = 7;          // points before the corner entry of the nearest road arrow (+2 per severity level)
+constexpr int      kArrowGap      = 3;          // points between the arrows of one corner
+constexpr int      kZoneTurn      = 36;         // brads (~50 deg): minimum total turn for a drift zone
+constexpr int      kZoneRunUp     = 5;          // points of road needed between the previous corner's exit and a zone corner
+constexpr int      kZoneMaxVSafe  = 140;        // px/s: only corners that really slow a grip car deserve a zone
+constexpr int      kZoneLines     = 3;          // max dotted lines per zone (every 2nd point, starting 1 point before entry)
+constexpr float    kHudLookS      = 0.9f;       // s of travel the HUD corner indicator looks ahead
+constexpr float    kHudLookMin    = 90.f;       // px
+constexpr float    kHudLookMax    = 220.f;      // px
 constexpr float    kCullR2        = 250.f * 250.f; // px^2, ignore points beyond
 constexpr int16_t  kHudH          = 9;          // bottom HUD strip height, px (rule + gap + 6 px text + pad)
 constexpr int16_t  kPlayH         = fb::SCREEN_H - kHudH;  // playable rows 0..kPlayH-1
@@ -207,20 +239,23 @@ struct Harm { float a; uint8_t k; float ph; };
 struct TrackDef {
   const char* name;
   const char* level;
+  uint8_t     half;     // road half-width, px: wide for easy tracks, narrow for hard ones
   float       r0;
   Harm        h[4];
 };
 
 const TrackDef kTracks[kTrackCount] = {
-  { "SAKURA",  "EASY",    420.f, {{21.f, 7, 5.99f}, {14.f, 6, 2.17f}, {19.f, 4, 3.52f}, {0.f, 0, 0.f}} },
-  { "ODAIBA",  "MEDIUM",  480.f, {{101.f, 2, 5.94f}, {15.f, 9, 4.03f}, {41.f, 7, 5.96f}, {0.f, 0, 0.f}} },
-  { "SHIBUYA", "TRICKY",  480.f, {{7.f, 11, 2.06f}, {62.f, 5, 0.19f}, {36.f, 10, 5.63f}, {0.f, 0, 0.f}} },
-  { "HAKONE",  "HARD",    400.f, {{17.f, 8, 4.67f}, {31.f, 11, 5.99f}, {37.f, 3, 3.34f}, {0.f, 0, 0.f}} },
-  { "IROHA",   "EXTREME", 480.f, {{42.f, 2, 2.82f}, {33.f, 9, 1.18f}, {35.f, 11, 1.24f}, {0.f, 0, 0.f}} },
-  { "USUI",    "EXPERT",  440.f, {{21.f, 2, 0.21f}, {10.f, 7, 2.77f}, {49.f, 11, 5.55f}, {0.f, 0, 0.f}} },
+  { "SAKURA",  "EASY", 22,    420.f, {{21.f, 7, 5.99f}, {14.f, 6, 2.17f}, {19.f, 4, 3.52f}, {0.f, 0, 0.f}} },
+  { "ODAIBA",  "MEDIUM", 20,  480.f, {{101.f, 2, 5.94f}, {15.f, 9, 4.03f}, {41.f, 7, 5.96f}, {0.f, 0, 0.f}} },
+  { "SHIBUYA", "TRICKY", 18,  480.f, {{7.f, 11, 2.06f}, {62.f, 5, 0.19f}, {36.f, 10, 5.63f}, {0.f, 0, 0.f}} },
+  { "HAKONE",  "HARD", 16,    400.f, {{17.f, 8, 4.67f}, {31.f, 11, 5.99f}, {37.f, 3, 3.34f}, {0.f, 0, 0.f}} },
+  { "IROHA",   "EXTREME", 14, 480.f, {{42.f, 2, 2.82f}, {33.f, 9, 1.18f}, {35.f, 11, 1.24f}, {0.f, 0, 0.f}} },
+  { "USUI",    "EXPERT", 13,  440.f, {{21.f, 2, 0.21f}, {10.f, 7, 2.77f}, {49.f, 11, 5.55f}, {0.f, 0, 0.f}} },
 };
 
 int     gN;                     // centreline points of the current track
+int16_t gRoadHalf;              // road half-width of the current track, px (render AND collision)
+float   gWallLim;               // car-centre limit from the centreline = gRoadHalf - kWallMargin
 float   gSp;                    // mean point spacing, px
 float   gTX[kTrackMax];         // centreline x
 float   gTY[kTrackMax];         // centreline y
@@ -231,6 +266,22 @@ int8_t  gTCur[kTrackMax];       // bend here (signed brads over +-3 pts = 72 px;
 uint8_t gVSafe[kTrackMax];      // AI planning speed through the bend here, px/s
 float   gBX0, gBY0, gBX1, gBY1; // bounding box (menu preview)
 
+// Corner table, derived once per track from gTCur / gVSafe (no per-corner hard-coding).
+struct Corner {
+  uint16_t entry, apex, exit;   // centreline indices
+  int8_t   dir;                 // +1 = left, -1 = right
+  uint8_t  sev;                 // 0 gentle, 1 medium, 2 sharp
+  uint8_t  turn;                // total turn, brads
+  bool     zone;                // a drift-initiation zone is painted before it
+};
+Corner  gCor[kCornerMax];
+int     gCorN;
+// per-point road marks: bits 0-1 arrow level (0 none, 1..3 = bend of the arrow), bit 2 arrow left,
+// bit 3 drift-zone line
+uint8_t gMark[kTrackMax];
+int8_t  gNextCor[kTrackMax];    // index of the next corner whose entry lies ahead of this point
+
+
 float trackRadius(const TrackDef& T, float t) {
   float r = T.r0;
   for (int i = 0; i < 4; ++i)
@@ -238,8 +289,114 @@ float trackRadius(const TrackDef& T, float t) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// Corner analysis. Segments the existing bend table gTCur into corners (hysteresis,
+// split at direction changes), grades them gentle / medium / sharp from the apex
+// bend, then derives the road marks (predictive arrows + drift zones) and the
+// "next corner" lookup used by the HUD. Runs once per track, init time only.
+// ---------------------------------------------------------------------------
+inline int absi(int v) { return v < 0 ? -v : v; }
+
+void analyseCorners() {
+  gCorN = 0;
+  for (int i = 0; i < gN; ++i) { gMark[i] = 0; gNextCor[i] = -1; }
+  int s0 = 0, bq = 1000;                         // start the scan on the quietest point (never mid-corner)
+  for (int i = 0; i < gN; ++i) { const int q = absi(gTCur[i]); if (q < bq) { bq = q; s0 = i; } }
+
+  int i = 0;
+  while (i < gN && gCorN < kCornerMax) {
+    const int c0 = gTCur[(s0 + i) % gN];
+    if (absi(c0) < kCorOn) { ++i; continue; }
+    const int sign = c0 > 0 ? 1 : -1;
+    int peak = absi(c0), pk = i, j = i + 1;
+    for (; j < gN; ++j) {
+      const int cj = gTCur[(s0 + j) % gN];
+      if (absi(cj) < kCorOff) break;
+      if (((cj > 0) ? 1 : -1) != sign && absi(cj) >= kCorOn) break;
+      if (absi(cj) > peak) { peak = absi(cj); pk = j; }
+    }
+    int turn = 0;                                // total signed turn through the corner
+    for (int k = i; k < j; ++k) {
+      const int a = (s0 + k) % gN, b = (s0 + k + 1) % gN;
+      turn += (int)wrapB((float)gTTan[b] - (float)gTTan[a]);
+    }
+    if (absi(turn) >= kCorMinTurn) {
+      Corner& c = gCor[gCorN++];
+      c.entry = (uint16_t)((s0 + i) % gN);
+      c.apex  = (uint16_t)((s0 + pk) % gN);
+      c.exit  = (uint16_t)((s0 + j - 1) % gN);
+      c.dir   = (int8_t)sign;
+      c.sev   = (uint8_t)(peak >= kSevSharp ? 2 : (peak >= kSevMed ? 1 : 0));
+      c.turn  = (uint8_t)(absi(turn) > 255 ? 255 : absi(turn));
+      c.zone  = false;
+    }
+    i = j;
+  }
+  // corners were found in scan order; entries wrap once around the loop
+
+  // ---- road marks ----
+  for (int ci = 0; ci < gCorN; ++ci) {
+    Corner& c = gCor[ci];
+    // the closest earlier corner: its exit bounds the zone, its apex bounds the arrows
+    int po = -1, gap = 1 << 20;
+    for (int o = 0; o < gCorN; ++o) {
+      if (o == ci) continue;
+      const int g = ((int)c.entry - (int)gCor[o].exit + gN) % gN;
+      if (g < gap) { gap = g; po = o; }
+    }
+    const int apexDist = (po >= 0) ? (((int)c.entry - (int)gCor[po].apex + gN) % gN) : gN / 2;
+
+    // predictive arrows: further out for sharper corners (they need more braking room); one arrow for
+    // gentle bends, a pair for medium/sharp ones, a trio for hairpins. On dense tracks the chain is
+    // pulled in so it never reaches back past the previous corner's apex (no cues on top of an apex).
+    int n = (c.sev >= 1) ? 2 : 1;
+    if (c.sev == 2 && absi((int)gTCur[c.apex]) >= 80) n = 3;
+    int off0 = kArrowLead + 2 * c.sev;
+    if (off0 > apexDist - 2) off0 = apexDist - 2;
+    if (off0 >= 3) {
+      for (int a = 0; a < n; ++a) {
+        const int off = off0 + a * kArrowGap;
+        if (off > apexDist - 2) break;
+        const int p = ((int)c.entry - off + 4 * gN) % gN;
+        bool busy = false;
+        for (int d = -1; d <= 1; ++d) if (gMark[(p + d + gN) % gN]) busy = true;
+        if (busy) continue;
+        gMark[p] = (uint8_t)((c.sev + 1) | (c.dir > 0 ? 4 : 0));
+      }
+    }
+
+    // drift-initiation zone: only real turns that slow a grip car, with road to get set up on.
+    // Dotted lines every 2nd point starting 1 point before the entry, kept inside the gap.
+    if (c.sev >= 1 && c.turn >= kZoneTurn && gap >= kZoneRunUp && gVSafe[c.apex] <= kZoneMaxVSafe) {
+      int lines = 0;
+      for (int z = 0; z < kZoneLines; ++z) if (1 + 2 * z <= gap - 2) ++lines;
+      bool ok = (lines >= 2);
+      for (int z = 0; ok && z < lines; ++z) {
+        const int p = ((int)c.entry - 1 - 2 * z + 4 * gN) % gN;
+        if (gMark[p] & 3) ok = false;
+      }
+      if (ok) {
+        c.zone = true;
+        for (int z = 0; z < lines; ++z) gMark[((int)c.entry - 1 - 2 * z + 4 * gN) % gN] |= 8;
+      }
+    }
+  }
+
+  // ---- "next corner" lookup: nearest entry strictly ahead of each point ----
+  for (int p = 0; p < gN; ++p) {
+    int bestD = gN + 1, bi = -1;
+    for (int ci = 0; ci < gCorN; ++ci) {
+      const int d = ((int)gCor[ci].entry - p + gN) % gN;
+      if (d > 0 && d < bestD) { bestD = d; bi = ci; }
+    }
+    gNextCor[p] = (int8_t)bi;
+  }
+}
+
 void buildTrack(int idx) {
   const TrackDef& T = kTracks[idx];
+  gRoadHalf = (int16_t)T.half;
+  gWallLim  = (float)T.half - kWallMargin;
   const int   S  = 3000;
   const float dT = 6.2831853f / (float)S;
   // pass 1: loop length
@@ -317,6 +474,7 @@ void buildTrack(int idx) {
     }
     gVSafe[i] = (uint8_t)clampf(worst, 45.f, 175.f);
   }
+  analyseCorners();
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +490,10 @@ struct Car {
   bool     drift;
   int8_t   driftDir;          // +1 = drifting left(CCW), -1 = right
   bool     wall;              // touched the boundary this frame
+  float    driftK;            // 0..1 drift intensity (blends grip / steering / drag; eases in and out)
+  float    slip;              // signed slip angle, brads (atan2 of sideways / forward velocity)
+  float    armT;              // s left in which the X-press kick may fire
+  bool     handPrev, kicked;  // X edge detection / kick already used for this press
   float    wallHit;           // impact speed of this frame's wall touch
   int16_t  seg, prevSeg, sj;  // nearest point / previous / segment index of lat
   int16_t  lap;               // 0 = behind the line, 1..kLaps, kLaps+1 = finished
@@ -415,7 +577,7 @@ void placeCar(Car& c, int seg, float lat) {
   locateCar(c);
   c.prevSeg = c.seg;
   c.speed = c.vF = c.vL = 0.f;
-  c.steer = 0.f; c.drift = false; c.driftDir = 0; c.wall = false; c.wallHit = 0.f;
+  c.steer = 0.f; c.drift = false; c.driftDir = 0; c.driftK = 0.f; c.slip = 0.f; c.armT = 0.f; c.handPrev = false; c.kicked = false; c.wall = false; c.wallHit = 0.f;
   c.lap = 0; c.done = false; c.finishMs = 0;
 }
 
@@ -444,7 +606,7 @@ void startRace() {
     if (!gMulti) s = 0;
     else if (i == 0) s = kPlayerSlot;
     else { s = slot; if (s == kPlayerSlot) { ++slot; s = slot; } ++slot; }
-    placeCar(gCars[i], gN - 2 - 2 * s, (s & 1) ? 6.f : -6.f);
+    placeCar(gCars[i], gN - 2 - 2 * s, (s & 1) ? gWallLim * 0.5f : -gWallLim * 0.5f);
   }
   for (int i = 1; i < gCarsN; ++i) {
     Car& c = gCars[i];
@@ -452,7 +614,7 @@ void startRace() {
     c.style     = (uint8_t)a;
     c.pace      = 0.76f + 0.022f * (float)gTrackSel + (a == 0 ? 0.03f : (a == 1 ? 0.0f : -0.02f));
     c.driftLike = (a == 0) ? 1.f : (a == 1 ? 0.6f : 0.f);
-    c.laneBias  = (a == 0) ? -3.f : (a == 1 ? 3.f : 0.f);
+    c.laneBias  = gWallLim * ((a == 0) ? -0.25f : (a == 1 ? 0.25f : 0.f));
     c.lane = c.laneBias; c.noise = c.noiseT = 0.f;
     c.goMs = (uint16_t)(120 + (rnd() % 350));
     c.recMode = 0; c.recSw = 0;
@@ -507,36 +669,84 @@ void driveCar(Car& c, const Ctl& k, float dt) {
     if (df > rate) c.steer += rate; else if (df < -rate) c.steer -= rate; else c.steer = tg;
   }
 
-  // ---- drift state: X (handbrake) + steer while carrying speed ----
-  c.drift = k.hand && fabsx(c.steer) > 0.15f && (vF > kDriftMinSpeed);
-  if (c.drift) c.driftDir = (int8_t)(c.steer > 0.f ? 1 : -1);
+  // ---- slip angle: how far the velocity points away from the nose (brads, signed) ----
+  // vL < 0 = sliding to the right of the nose (a LEFT drift), vL > 0 = sliding left.
+  const float s    = (vF > 15.f) ? atan2B(vL, vF) : 0.f;
+  const float beta = fabsx(s);
+  c.slip = s;
+  const float excess = clampf((beta - kSlipSweet) / (kSlipMax - kSlipSweet), 0.f, 1.5f);  // 0 = clean, 1 = full penalty
 
-  // ---- lateral grip (drifting slashes it -> the car slides) ----
-  const float grip = c.drift ? kDriftGrip : kGrip;
+  // ---- drift state: X (handbrake) + steering while carrying speed ----
+  const float aS = fabsx(c.steer);
+  const bool holding = k.hand && vF > kDriftMinSpeed * 0.8f &&
+                       aS > (c.driftK > 0.3f ? kDriftHoldMin : kDriftSteerMin);
+  c.drift = holding;
+  if (holding) c.driftDir = (int8_t)(c.steer > 0.f ? 1 : -1);
+  const bool counter = (c.steer * s > 0.f);                // steering toward the slide's own side: reduces the angle
+
+  // initiation kick: pressing X while steering (within a short window) swings the nose into the
+  // turn. Scaled by speed and steering, zero below the minimum speed, once per press, never automatic.
+  if (k.hand && !c.handPrev) { c.armT = kKickWindow; c.kicked = false; }
+  c.handPrev = k.hand;
+  if (!k.hand) { c.armT = 0.f; c.kicked = false; }
+  else if (c.armT > 0.f) c.armT -= dt;
+  if (holding && !c.kicked && c.armT > 0.f && aS >= kDriftSteerMin && c.driftK < 0.4f && beta < 12.f) {
+    const float sfk = clampf((vF - 35.f) * (1.f / 70.f), 0.3f, 1.f);
+    c.head += (c.steer > 0.f ? 1.f : -1.f) * kDriftKick * sfk * clampf(aS, 0.3f, 1.f);
+    c.kicked = true;
+  }
+
+  // drift intensity eases in quickly and out slowly (countersteering speeds the recovery up)
+  if (holding) {
+    c.driftK += kDriftKIn * dt;  if (c.driftK > 1.f) c.driftK = 1.f;
+  } else {
+    float r = kDriftKOut * (counter ? 1.8f : 1.f);
+    c.driftK -= r * dt;          if (c.driftK < 0.f) c.driftK = 0.f;
+  }
+  const float K = c.driftK;
+
+  // ---- lateral grip: drops with drift intensity, but RISES with slip angle so a slide self-limits ----
+  const float ratio = beta * (1.f / kSlipRef);
+  const float grip = (kGrip + (kDriftGrip - kGrip) * K) * (1.f + K * kSlipGrip * ratio * ratio);
   float g = grip * dt; if (g > 1.f) g = 1.f;
   const float vL0 = vL;
   vL -= vL * g;
-  // while sliding, most of the lost sideways momentum is kept as forward speed
-  if (c.drift && vF > 20.f) vF += kDriftKeep * (vL0 * vL0 - vL * vL) / (2.f * vF);
+  // sideways momentum is converted into forward speed, fading out as the angle becomes excessive
+  if (vF > 20.f) vF += kDriftKeep * K * (1.f - clampf(excess, 0.f, 1.f)) * (vL0 * vL0 - vL * vL) / (2.f * vF);
+  // excessive sideways sliding scrubs speed progressively
+  if (K > 0.f && vF > 0.f) {
+    float sc = (kSlipBase * clampf(beta * (1.f / kSlipSweet), 0.f, 1.f) + kSlipScrub * excess) * K * dt;
+    if (sc > 0.5f) sc = 0.5f;
+    vF -= vF * sc; vL -= vL * sc;
+  }
 
   // ---- longitudinal ----
   if (k.up) vF += kAccel * dt;
-  if (k.dn) vF -= (c.drift ? kBrake * 0.20f : kBrake) * dt;
-  if (k.hand && !c.drift && vF > 0.f) vF -= kBrake * 0.35f * dt;   // plain handbrake scrubs speed
-  vF -= vF * kDrag * (c.drift ? kDriftDragMul : 1.f) * dt;
+  if (k.dn) vF -= kBrake * (1.f - 0.8f * K) * dt;
+  if (k.hand && !holding && vF > 0.f) vF -= kBrake * 0.35f * dt;   // plain handbrake scrubs speed
+  vF -= vF * kDrag * (1.f - (1.f - kDriftDragMul) * K) * dt;
   if (!k.up && !k.dn) {
     const float r = kRoll * dt;
     if (vF > r) vF -= r; else if (vF < -r) vF += r; else vF = 0.f;
   }
   if (vF >  kMaxSpeed)   vF =  kMaxSpeed;
   if (vF < -kMaxReverse) vF = -kMaxReverse;
+  {   // the TRUE speed (forward + sideways) can never exceed top speed: a slide is not a speed boost
+    const float m2 = vF * vF + vL * vL;
+    if (m2 > kMaxSpeed * kMaxSpeed) { const float f = kMaxSpeed / sqrtf(m2); vF *= f; vL *= f; }
+  }
 
   // ---- steering (sign of vF flips it naturally in reverse) ----
   float sf = vF / 55.f;
   if (sf > 1.f) sf = 1.f; else if (sf < -1.f) sf = -1.f;
   float topFade = 1.f - 0.30f * (vF / kMaxSpeed);
   if (topFade < 0.7f) topFade = 0.7f;
-  c.head += c.steer * kSteer * sf * topFade * (c.drift ? kDriftSteerMul : 1.f) * dt;
+  float sm = 1.f + (kDriftSteerMul - 1.f) * K;
+  if (K > 0.f && beta > 0.f) {
+    if (counter) sm *= 1.f + (kCounterBoost - 1.f) * K;                               // countersteer bites harder
+    else         sm *= 1.f - kDeepSteerCut * clampf(excess, 0.f, 1.f);                // pushing deeper loses authority
+  }
+  c.head += c.steer * kSteer * sf * topFade * sm * dt;
   while (c.head >= 256.f) c.head -= 256.f;
   while (c.head <   0.f)  c.head += 256.f;
 
@@ -549,12 +759,12 @@ void driveCar(Car& c, const Ctl& k, float dt) {
   // ---- track boundary: never leave the road; lose speed and slide along it ----
   locateCar(c);
   c.wall = false; c.wallHit = 0.f;
-  const float over = fabsx(c.lat) - kWallLim;
+  const float over = fabsx(c.lat) - gWallLim;
   if (over > 0.f) {
     const float sgn = (c.lat > 0.f) ? 1.f : -1.f;
     const float nx = -gSY[c.sj] * sgn, ny = gSX[c.sj] * sgn;     // outward normal
     c.x -= nx * over; c.y -= ny * over;                          // back onto the road
-    c.lat = sgn * kWallLim;
+    c.lat = sgn * gWallLim;
     const float vn = c.vx * nx + c.vy * ny;                      // outward speed
     c.wall = true;
     if (vn > 0.f) {
@@ -585,7 +795,7 @@ void driveCar(Car& c, const Ctl& k, float dt) {
     const float ax = cosB(h2) * (1.f / 32768.f), ay = sinB(h2) * (1.f / 32768.f);
     c.vF = c.vx * ax + c.vy * ay;
     c.vL = -c.vx * ay + c.vy * ax;
-    c.speed = fabsx(c.vF) + 0.5f * fabsx(c.vL);                  // cheap |v| approx
+    c.speed = sqrtf(c.vF * c.vF + c.vL * c.vL);                 // true speed
   }
 
   // ---- lap counting: crossing start/finish forward (+1) or backward (-1) ----
@@ -720,7 +930,7 @@ void aiThink(Car& c, Ctl& k, int me, uint32_t dtMs, float dt) {
   if (c.recMs) {
     const float e  = wrapB((float)gTTan[(c.seg + 3) % gN] - c.head);
     const float ae = fabsx(e);
-    if (c.recMode == 0) c.recMode = (ae > 40.f && (fabsx(c.lat) > 7.f || av < 6.f)) ? 1 : 2;
+    if (c.recMode == 0) c.recMode = (ae > 40.f && (fabsx(c.lat) > gWallLim * 0.6f || av < 6.f)) ? 1 : 2;
     if (c.recSw < 5000) c.recSw = (uint16_t)(c.recSw + dtMs);
     // K-turn: swap direction whenever a wall stops us and the nose is still wrong
     if (c.recSw > 350 && c.wall && ae > 30.f) { c.recMode = (c.recMode == 1) ? 2 : 1; c.recSw = 0; }
@@ -742,7 +952,8 @@ void aiThink(Car& c, Ctl& k, int me, uint32_t dtMs, float dt) {
   const float curA = (float)gTCur[ti];                           // + = left bend ahead
 
   // ---- other cars: follow / overtake ----
-  float laneT = c.laneBias + clampf(curA * 0.2f, -6.f, 6.f);     // slightly cut the inside of bends
+  const float laneMax = gWallLim * 0.7f;
+  float laneT = c.laneBias + clampf(curA * 0.2f, -gWallLim * 0.5f, gWallLim * 0.5f);     // slightly cut the inside of bends
   float capV  = 1e9f;
   const bool bendy = fabsx(curA) > 20.f;
   const float look = 46.f + 0.25f * av;
@@ -756,8 +967,8 @@ void aiThink(Car& c, Ctl& k, int me, uint32_t dtMs, float dt) {
     if (fabsx(l) > 14.f) continue;
     if (!bendy || f < 24.f) {
       float s = (o.lat > c.lat) ? -1.f : 1.f;                    // pass on the open side
-      float tgt = clampf(o.lat + s * 12.f, -8.5f, 8.5f);
-      if (fabsx(tgt - o.lat) < 8.f) { s = -s; tgt = clampf(o.lat + s * 12.f, -8.5f, 8.5f); }
+      float tgt = clampf(o.lat + s * gWallLim, -laneMax, laneMax);
+      if (fabsx(tgt - o.lat) < gWallLim * 0.65f) { s = -s; tgt = clampf(o.lat + s * gWallLim, -laneMax, laneMax); }
       laneT = tgt;
     }
     if (f > 0.f && f < 26.f && fabsx(l) < 8.f) {                 // right behind: do not ram
@@ -1018,6 +1229,19 @@ void seg(U8G2& d, int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
     d.drawLine((u8g2_uint_t)x0, (u8g2_uint_t)y0, (u8g2_uint_t)x1, (u8g2_uint_t)y1);
 }
 
+// dotted line (every 2nd pixel), clipped to the playable area
+void dotSeg(U8G2& d, int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+  const int16_t dx = (int16_t)(x1 - x0), dy = (int16_t)(y1 - y0);
+  const int16_t adx = (int16_t)(dx < 0 ? -dx : dx), ady = (int16_t)(dy < 0 ? -dy : dy);
+  const int16_t n = (adx > ady) ? adx : ady;
+  if (n == 0) return;
+  for (int16_t j = 0; j <= n; j += 2) {
+    const int16_t x = (int16_t)(x0 + (int16_t)(((int32_t)dx * j) / n));
+    const int16_t y = (int16_t)(y0 + (int16_t)(((int32_t)dy * j) / n));
+    if (x >= 0 && x < (int16_t)fb::SCREEN_W && y >= 0 && y < kPlayH) d.drawPixel((u8g2_uint_t)x, (u8g2_uint_t)y);
+  }
+}
+
 // world point -> screen; returns false when outside the coarse view radius
 inline bool xform(float wx, float wy, float cosC, float sinC, int16_t& sx, int16_t& sy) {
   const float rx = wx - gP.x, ry = wy - gP.y;
@@ -1143,8 +1367,8 @@ void renderWorld(U8G2& d) {
     const float nxc = nx * cosC + ny * sinC;
     const float nyc = -nx * sinC + ny * cosC;
     mx[k] = sx;                 my[k] = sy;
-    ex[k] = (int16_t)(sx + nxc * kRoadHalf); ey[k] = (int16_t)(sy - nyc * kRoadHalf);
-    fx[k] = (int16_t)(sx - nxc * kRoadHalf); fy[k] = (int16_t)(sy + nyc * kRoadHalf);
+    ex[k] = (int16_t)(sx + nxc * (float)gRoadHalf); ey[k] = (int16_t)(sy - nyc * (float)gRoadHalf);
+    fx[k] = (int16_t)(sx - nxc * (float)gRoadHalf); fy[k] = (int16_t)(sy + nyc * (float)gRoadHalf);
     // outward step for the thick road edge: dominant screen axis of (centre -> left edge)
     const int16_t odx = (int16_t)(ex[k] - sx), ody = (int16_t)(ey[k] - sy);
     const int16_t adx = (int16_t)(odx < 0 ? -odx : odx), ady = (int16_t)(ody < 0 ? -ody : ody);
@@ -1164,14 +1388,23 @@ void renderWorld(U8G2& d) {
     seg(d, fx[k - 1], fy[k - 1], fx[k], fy[k]);
     seg(d, (int16_t)(fx[k - 1] - ox[k - 1]), (int16_t)(fy[k - 1] - oy[k - 1]),
            (int16_t)(fx[k] - ox[k]),         (int16_t)(fy[k] - oy[k]));
-    // centre dashes (6 points on / 6 off)
-    if ((i % 12) < 6) seg(d, mx[k - 1], my[k - 1], mx[k], my[k]);
-    // road arrows: tangent direction at that point -> rotate with the road
-    if (i % kArrowEvery == 3 && mx[k] >= 8 && mx[k] <= (int16_t)(fb::SCREEN_W - 8)
-                             && my[k] >= 6 && my[k] <= (int16_t)(kPlayH - 6)) {
-      const uint8_t scrA = (uint8_t)(gTTan[i] - C);
-      const bool strong = (gTCur[i] > 24 || gTCur[i] < -24);
-      drawArrow(d, mx[k], my[k], scrA, strong);
+    // centre dashes (6 points on / 6 off), left out around a corner arrow so the arrow reads cleanly
+    const uint8_t mk = gMark[i];
+    if ((i % 12) < 6 && !(mk & 3) && !(gMark[ti[k - 1]] & 3)) seg(d, mx[k - 1], my[k - 1], mx[k], my[k]);
+    // predictive corner arrows (painted on the road, world-anchored): the arrow is the road tangent at
+    // this point turned toward the coming bend, so it rotates with the track and shows left vs right
+    if ((mk & 3) && mx[k] >= 8 && mx[k] <= (int16_t)(fb::SCREEN_W - 8)
+                 && my[k] >= 6 && my[k] <= (int16_t)(kPlayH - 6)) {
+      static const uint8_t kTurnBrads[4] = { 0, 28, 38, 48 };      // how far the arrow leans: gentle / medium / sharp
+      const uint8_t lvl = (uint8_t)(mk & 3);
+      const uint8_t lean = (mk & 4) ? kTurnBrads[lvl] : (uint8_t)(256 - kTurnBrads[lvl]);
+      drawArrow(d, mx[k], my[k], (uint8_t)(gTTan[i] - C + lean), false);
+    }
+    // drift-initiation zone: a dotted line across the road, clearly unlike the solid road arrows
+    if (mk & 8) {
+      const int16_t ax = (int16_t)(mx[k] + ((ex[k] - mx[k]) * 3) / 4), ay = (int16_t)(my[k] + ((ey[k] - my[k]) * 3) / 4);
+      const int16_t bx = (int16_t)(mx[k] + ((fx[k] - mx[k]) * 3) / 4), by = (int16_t)(my[k] + ((fy[k] - my[k]) * 3) / 4);
+      dotSeg(d, ax, ay, bx, by);
     }
     // trees, alternating sides
     if (i % 22 == 11) {
@@ -1185,10 +1418,10 @@ void renderWorld(U8G2& d) {
     // start/finish checker line
     if (i == 0) {
       const int16_t tdx = (int16_t)(mx[k] - mx[k - 1]), tdy = (int16_t)(my[k] - my[k - 1]);
-      for (int m = -14; m <= 14; m += 4) {
-        int16_t bx = (int16_t)(mx[k] + (int16_t)(((ex[k] - mx[k]) * m) / 16));
-        int16_t by = (int16_t)(my[k] + (int16_t)(((ey[k] - my[k]) * m) / 16));
-        if ((((m + 14) / 4) & 1)) { bx = (int16_t)(bx + tdx / 4); by = (int16_t)(by + tdy / 4); }
+      for (int m = -7; m <= 7; m += 2) {                      // 8 steps across the road, any width
+        int16_t bx = (int16_t)(mx[k] + (int16_t)(((ex[k] - mx[k]) * m) / 8));
+        int16_t by = (int16_t)(my[k] + (int16_t)(((ey[k] - my[k]) * m) / 8));
+        if ((((m + 7) / 2) & 1)) { bx = (int16_t)(bx + tdx / 4); by = (int16_t)(by + tdy / 4); }
         if (bx >= 1 && bx <= (int16_t)(fb::SCREEN_W - 3) && by >= 1 && by <= (int16_t)(kPlayH - 3))
           d.drawBox((u8g2_uint_t)(bx - 1), (u8g2_uint_t)(by - 1), 3, 3);
       }
@@ -1287,13 +1520,38 @@ void renderMinimap(U8G2& d) {
   d.drawPixel((u8g2_uint_t)kMapCx, (u8g2_uint_t)kMapCy);
 }
 
+// Next-corner indicator for the HUD: the nearest corner entry ahead of the car, shown only inside a
+// look-ahead of ~kHudLookS seconds of travel. Direction = chevron side, severity = 1..3 chevrons.
+bool nextCorner(int& dir, int& sev) {
+  const int ci = gNextCor[gP.seg];
+  if (ci < 0) return false;
+  const Corner& c = gCor[ci];
+  const float dist = (float)(((int)c.entry - (int)gP.seg + gN) % gN) * gSp;
+  float spd = gP.vF; if (spd < 60.f) spd = 60.f;
+  if (dist > clampf(kHudLookS * spd, kHudLookMin, kHudLookMax)) return false;
+  dir = c.dir; sev = c.sev;
+  return true;
+}
+
+// 3x5 px chevrons, 4 px apart, rows 57..61 (inside the 5x7 text band of the HUD strip)
+void drawChevrons(U8G2& d, int16_t x0, int dir, int n) {
+  for (int k = 0; k < n; ++k) {
+    const int16_t x = (int16_t)(x0 + 4 * k);
+    for (int r = 0; r < 5; ++r) {
+      const int off = (r < 3) ? r : (4 - r);              // 0,1,2,1,0
+      const int16_t px = (int16_t)(dir > 0 ? (x + 2 - off) : (x + off));
+      d.drawPixel((u8g2_uint_t)px, (u8g2_uint_t)(57 + r));
+    }
+  }
+}
+
 void fmtTime(char* b, uint32_t ms) {
   snprintf(b, 14, "%lu:%02lu.%lu", (unsigned long)(ms / 60000UL),
            (unsigned long)((ms / 1000UL) % 60UL), (unsigned long)((ms / 100UL) % 10UL));
 }
 
-// One compact HUD strip at the very bottom: [ LAP x/3 | NNN KM/H | m:ss.t ].
-// Multiplayer: [ P2/4 L1/3 | NNNKM/H | m:ss.t ].
+// One compact HUD strip at the very bottom: [ LAP x/3 | NNN KMH | corner | m:ss.t ].
+// Multiplayer: [ P2/4 L1/3 | NNNKMH | corner | m:ss.t ]. 'corner' = 1-3 chevrons for the next bend.
 // Row kHudY is a 1 px separator rule, then a 1 px gap, 6 px of text and a 1 px
 // bottom pad (kHudH = 9). The strip is outside the playable area (rows
 // 0..kPlayH-1), so it can never cover road.
@@ -1312,13 +1570,17 @@ void renderHud(U8G2& d) {
   if (gMulti) {
     snprintf(buf, sizeof(buf), "P%d/%d L%d/%d", (int)calcPlace(0), gCarsN, lap, (int)kLaps);
     d.drawStr(1, by, buf);
-    snprintf(buf, sizeof(buf), "%3dKM/H", (int)(gP.speed * kKmhScale));
-    d.drawStr(52, by, buf);
+    snprintf(buf, sizeof(buf), "%3dKMH", (int)(gP.speed * kKmhScale));
+    d.drawStr(50, by, buf);
   } else {
     snprintf(buf, sizeof(buf), "LAP %d/%d", lap, (int)kLaps);
     d.drawStr(2, by, buf);                                              // left
-    snprintf(buf, sizeof(buf), "%3d KM/H", (int)(gP.speed * kKmhScale));// fixed width -> no jitter
-    d.drawStr((u8g2_uint_t)((fb::SCREEN_W - d.getStrWidth(buf)) / 2), by, buf);   // centre
+    snprintf(buf, sizeof(buf), "%3d KMH", (int)(gP.speed * kKmhScale)); // fixed width -> no jitter
+    d.drawStr((u8g2_uint_t)((fb::SCREEN_W - d.getStrWidth(buf)) / 2 - 2), by, buf);  // centre
+  }
+  {
+    int cd, cs;
+    if (nextCorner(cd, cs)) drawChevrons(d, 83, cd, cs + 1);                    // next corner, between speed and time
   }
   fmtTime(buf, gRaceMs);
   d.drawStr((u8g2_uint_t)(fb::SCREEN_W - 2 - d.getStrWidth(buf)), by, buf);     // right

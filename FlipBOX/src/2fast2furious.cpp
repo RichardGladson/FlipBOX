@@ -9,18 +9,18 @@
 //   the results screen also offers an explicit RETRY / QUIT menu.
 //
 // Drift model (all Q16.16 fixed-point, integrated with Frame::dtUs):
-//   theta  car nose angle relative to the road tangent          [deg]
-//   phi    direction the car is actually travelling, same frame [deg]
-//   beta   slip angle = theta - phi (what the player sees as "drift angle")
-//   omega  car yaw rate [deg/s],  grip = rear-tyre grip 0..1
-//   The road rotates under the car at rho = curve * speed * kRoadTurn.
-//     theta' = omega - rho
-//     phi'   = -rho + grip * kTireRate * beta     (tyres drag travel toward nose)
-//     omega -> G*steer + kFollow*grip*rho - kStab*grip*beta   (first-order lag)
-//   Low rear grip lets phi lag theta, i.e. the car travels sideways. Grip is cut
-//   by the handbrake, by throttle + full lock at speed, and (feedback) by a big
-//   slip angle -- which is what keeps an established slide alive. Lifting off,
-//   braking and countersteering give grip / yaw back and straighten the car.
+//   phi   the car's PATH: travel direction relative to the road  [deg]
+//   beta  SLIP ANGLE: nose relative to travel direction          [deg]  (the drift)
+//   Both are first-order and anchored, so with no keys held on a straight the
+//   car straightens out by itself (nothing integrates away):
+//     phi'  = kPath*(phiTarget - phi) - roadTurn*(1 - assist*grip) + kTurnIn*(1 - grip)*beta
+//             phiTarget = lock * steer * grip     (grip steering = steady sideways speed)
+//     beta' = -kAlign*grip*beta + drive
+//             drive = handbrake / power-over tail push + steering into (or against)
+//                     an established slide - line balance; tapered to zero near 75 deg
+//   Rear grip is cut by the handbrake, by throttle + full lock at speed, and
+//   (feedback) by a big slip angle -- which is what keeps a slide alive. Lifting
+//   off, braking and countersteering give grip back and straighten the car.
 //
 // Scoring: points accrue while |beta| is in the drift window, weighted by
 // speed, an angle bell (best ~30-45 deg, zero past ~75 deg) and smoothness.
@@ -102,6 +102,11 @@ inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo 
 inline int32_t absI32(int32_t v) { return v < 0 ? -v : v; }
 // Exponential-approach factor for "x += (target - x) * rate * dt"; clamped to
 // 1.0 so a long frame can never overshoot the target (frame-rate safe).
+// Clamped ratio num/den as Q16.16 in [0,1] (64-bit intermediate; multiply, not
+// shift, so negative numerators are well-defined).
+inline int32_t ratioQ16(int32_t num, int32_t den) {
+  return clampI32((int32_t)(((int64_t)num * 65536) / den), 0, 65536);
+}
 inline int32_t stepFactor(int32_t rateQ, int32_t dt16) { return clampI32(mulQ16(rateQ, dt16), 0, 65536); }
 inline int32_t approach(int32_t cur, int32_t tgt, int32_t rateQ, int32_t dt16) {
   return cur + mulQ16(tgt - cur, stepFactor(rateQ, dt16));
@@ -112,9 +117,9 @@ inline int32_t approach(int32_t cur, int32_t tgt, int32_t rateQ, int32_t dt16) {
 // ---------------------------------------------------------------------------
 
 // -- speed --
-constexpr int32_t kTopSpeedQ   = Q(230.0f);    // km/h overall top speed
-constexpr int32_t kAccelQ      = Q(65.0f);     // km/h/s at standstill (UP)
-constexpr int32_t kAccelTaperQ = Q(0.65f);     // accel *= 1 - taper * v/top
+constexpr int32_t kTopSpeedQ   = Q(190.0f);    // km/h overall top speed
+constexpr int32_t kAccelQ      = Q(42.0f);     // km/h/s at standstill (UP)
+constexpr int32_t kAccelTaperQ = Q(0.72f);     // accel *= 1 - taper * v/top
 constexpr int32_t kBrakeQ      = Q(130.0f);    // km/h/s while DOWN is held
 constexpr int32_t kDragBaseQ   = Q(9.0f);      // km/h/s coasting (rolling resistance)
 constexpr int32_t kDragAeroQ   = Q(55.0f);     // km/h/s extra coasting drag at top speed (grows with v^2)
@@ -132,49 +137,64 @@ constexpr int32_t kOffEdgeQ    = 65536;        // |x| beyond this = off the tarm
 constexpr int32_t kWallKeepQ   = Q(0.60f);     // fraction of speed kept after a barrier hit
 constexpr uint32_t kWallCoolUs = 500000UL;     // minimum time between barrier hits
 
-// -- steering / yaw --
-constexpr int32_t kSteerRiseQ  = Q(11.0f);     // 1/s   steering position builds toward +-1
-constexpr int32_t kSteerFallQ  = Q(14.0f);     // 1/s   and returns to centre
-constexpr int32_t kYawMaxQ     = Q(105.0f);    // deg/s full-lock yaw authority
-constexpr int32_t kYawRampKmhQ = Q(35.0f);     // km/h below which authority fades (no spinning on the spot)
-constexpr int32_t kYawFadeQ    = Q(0.45f);     // authority lost at top speed
-constexpr int32_t kCounterQ    = Q(1.50f);     // authority multiplier when steering AGAINST the slide
-constexpr int32_t kYawRespQ    = Q(12.0f);     // 1/s   yaw rate lag toward its target
-constexpr int32_t kStabQ       = Q(5.0f);      // deg/s of restoring yaw per degree of slip (x grip)
-constexpr int32_t kFollowQ     = Q(0.70f);     // share of the road's turn rate the car follows by itself (x grip)
-constexpr int32_t kOmMaxQ      = Q(320.0f);    // deg/s yaw-rate clamp
-constexpr int32_t kTireRateQ   = Q(5.0f);      // 1/s   travel direction chases the nose at this rate x grip
-constexpr int32_t kPhMaxQ      = Q(75.0f);     // deg   travel-direction clamp (keeps cos > 0)
-constexpr int32_t kBetaMaxQ    = Q(110.0f);    // deg   slip-angle clamp
+// -- steering input and PATH (travel direction relative to the road) --
+// Grip steering sets a TARGET path angle, so a held key gives a steady sideways
+// speed (like the original game) and releasing it lets the car straighten.
+// Sensitivity retune (v2): roughly 2x lock, 3x path chase, faster steer ramp,
+// less fade at speed so the car answers the wheel immediately.
+constexpr int32_t kSteerRiseQ  = Q(18.0f);     // 1/s   steering position builds toward +-1
+constexpr int32_t kSteerFallQ  = Q(16.0f);     // 1/s   and returns to centre
+constexpr int32_t kPhiLockQ    = Q(28.0f);     // deg   path angle at full lock (low speed, full grip)
+constexpr int32_t kPhiFadeQ    = Q(0.25f);     // lock lost at top speed (less fade)
+constexpr int32_t kPathRateQ   = Q(9.0f);      // 1/s   path angle chases its target (anchors it to the road)
+constexpr int32_t kRoadAssistQ = Q(0.55f);     // share of the road's turning that grip cancels for you
+constexpr int32_t kSlideTurnQ  = Q(0.90f);     // 1/s   a sliding car's path turns toward its nose (x lost grip)
+constexpr int32_t kPhMaxQ      = Q(75.0f);     // deg   path-angle clamp (keeps cos > 0)
+
+// -- SLIP ANGLE beta (nose relative to travel direction): the drift itself --
+// Sensitivity retune: higher drive, lower gate (authority from first degree),
+// stronger countersteer / line balance / taper so higher gain stays controllable.
+constexpr int32_t kAlignQ      = Q(5.0f);      // 1/s   tyres realign the nose (x grip): slow when sliding = momentum
+constexpr int32_t kAlignRecQ   = Q(10.0f);     // 1/s   spin recovery realignment
+constexpr int32_t kSlipSteerQ  = Q(52.0f);     // deg/s steering into an established slide holds / widens it
+constexpr int32_t kCounterQ    = Q(2.2f);      // countersteer authority multiplier
+constexpr int32_t kGateLoQ     = Q(0.0f);      // deg   steering works from the first degree of slip
+constexpr int32_t kGateSpanQ   = Q(6.0f);      // deg   ... fully from lo+span
+constexpr int32_t kGateFloorQ  = Q(0.55f);     // steering authority floor on a car that has lost grip (see stepCar)
+constexpr int32_t kLineBalQ    = Q(18.0f);     // deg/s of slip trimmed per deg of path error while sliding (holds the line)
+constexpr int32_t kPowDriveQ   = Q(55.0f);     // deg/s power-over (throttle + lock at speed) pushes the tail out
+constexpr int32_t kTaperEndQ   = Q(75.0f);     // deg   drives taper to zero here so a slide can't run away ...
+constexpr int32_t kTaperSpanQ  = Q(35.0f);     // deg   ... starting this far below it
+constexpr int32_t kBetaMaxQ    = Q(85.0f);     // deg   slip-angle clamp
 
 // -- rear grip (1.0 = full) --
 constexpr int32_t kGripMinQ    = Q(0.16f);
 constexpr int32_t kGripHbQ     = Q(0.70f);     // grip removed by a fully applied handbrake
-constexpr int32_t kGripPowerQ  = Q(0.50f);     // grip removed by throttle + full lock at high speed
-constexpr int32_t kPowerV0Q    = Q(75.0f);     // km/h power-over starts
-constexpr int32_t kPowerV1Q    = Q(140.0f);    // km/h power-over fully developed
-constexpr int32_t kPowerStQ    = Q(0.55f);     // steering position above which power-over bites
+constexpr int32_t kGripPowerQ  = Q(0.55f);     // grip removed by throttle + full lock at high speed
+constexpr int32_t kPowerV0Q    = Q(45.0f);     // km/h power-over starts (lower threshold)
+constexpr int32_t kPowerV1Q    = Q(100.0f);    // km/h power-over fully developed
+constexpr int32_t kPowerStQ    = Q(0.35f);     // steering position above which power-over bites
 constexpr int32_t kGripSlideQ  = Q(0.40f);     // grip removed by a large slip angle (keeps a slide alive)
-constexpr int32_t kSlideStartQ = Q(14.0f);     // deg
-constexpr int32_t kSlideSpanQ  = Q(30.0f);     // deg over which the slide feedback builds
+constexpr int32_t kSlideStartQ = Q(12.0f);     // deg
+constexpr int32_t kSlideSpanQ  = Q(28.0f);     // deg over which the slide feedback builds
 constexpr int32_t kGripLiftQ   = Q(0.22f);     // grip returned when the throttle is released
 constexpr int32_t kGripBrakeQ  = Q(0.18f);     // extra grip while braking
 constexpr int32_t kGripFallQ   = Q(14.0f);     // 1/s   grip is lost quickly ...
 constexpr int32_t kGripRiseQ   = Q(3.0f);      // 1/s   ... and regained slowly (momentum)
 
 // -- handbrake (X) --
-constexpr int32_t  kHbRiseQ     = Q(14.0f);    // 1/s
+constexpr int32_t  kHbRiseQ     = Q(16.0f);    // 1/s
 constexpr int32_t  kHbFallQ     = Q(5.0f);     // 1/s
 constexpr uint32_t kHbMaxUs     = 700000UL;    // longest effective hold; release and press again for more
-constexpr int32_t  kHbMinSpeedQ = Q(45.0f);    // km/h below which the handbrake does nothing
-constexpr int32_t  kHbKickQ     = Q(130.0f);   // deg/s yaw impulse on press (toward steering / corner)
+constexpr int32_t  kHbMinSpeedQ = Q(40.0f);    // km/h below which the handbrake does nothing
+constexpr int32_t  kHbKickQ     = Q(22.0f);    // deg slip-angle kick on press (toward steering / corner)
+constexpr int32_t  kHbDriveQ    = Q(130.0f);   // deg/s tail push while held (x handbrake level)
 constexpr int32_t  kHbScrubQ    = Q(28.0f);    // km/h/s scrubbed at full handbrake
 
 // -- spin-out / recovery --
 constexpr int32_t  kSpinDegQ    = Q(78.0f);    // |slip| above this ...
 constexpr uint32_t kSpinUs      = 350000UL;    // ... for this long = spin-out
 constexpr uint32_t kRecoverUs   = 800000UL;    // assisted recovery time
-constexpr int32_t  kRecoverStabQ= Q(14.0f);    // strong self-alignment while recovering
 constexpr int32_t  kRecoverAccelQ = Q(0.30f);  // throttle strength while recovering
 constexpr int32_t  kRecoverDragQ  = Q(80.0f);  // km/h/s extra drag while recovering
 
@@ -183,7 +203,7 @@ constexpr int32_t  kDriftOnQ    = Q(13.0f);    // deg  slip angle that starts a 
 constexpr int32_t  kDriftOffQ   = Q(8.0f);     // deg  slip angle that ends it (hysteresis)
 constexpr int32_t  kDriftMinSpeedQ = Q(45.0f); // km/h
 constexpr uint32_t kDriftValidUs= 250000UL;    // slide must persist this long to count
-constexpr uint32_t kGraceUs     = 1200000UL;   // chain survives this long without a drift
+constexpr uint32_t kGraceUs     = 1500000UL;   // chain survives this long without a drift
 constexpr uint32_t kMultStepUs  = 1600000UL;   // sustained drift time per multiplier step
 constexpr uint32_t kMultMax     = 6;
 constexpr int32_t  kAfLoQ       = Q(13.0f);    // angle bell: 0 at lo, 1 at midLo ...
@@ -200,10 +220,15 @@ constexpr uint32_t kPendCapQ8   = 99999UL * 256UL;   // pending pool cap (Q24.8 
 constexpr uint32_t kScoreCap    = 999999UL;
 
 // -- camera --
-constexpr int32_t kCamFollowQ   = Q(0.45f);    // share of the car's yaw the view follows
-constexpr int32_t kCamMaxQ      = Q(45.0f);    // deg
-constexpr int32_t kCamRateQ     = Q(8.0f);     // 1/s
+// Stronger horizon swing so drifts read clearly; lower follow so the car's
+// own yaw (sprite) dominates the visual angle.
+constexpr int32_t kCamFollowQ   = Q(0.28f);    // share of the car's yaw the view follows
+constexpr int32_t kCamMaxQ      = Q(50.0f);    // deg
+constexpr int32_t kCamRateQ     = Q(10.0f);    // 1/s
 constexpr int32_t kShearDiv     = kRoadHalfM << 16;   // projection: px per metre = hw / kRoadHalfM
+
+// -- visual road scroll (stripes / dashes only; physics & map use real distance) --
+constexpr int32_t kScrollMulQ   = Q(3.0f);     // 3x visual scroll rate
 
 // -- pseudo-3D projection --
 constexpr int kHorizonY = 24;                            // y of the horizon line
@@ -283,13 +308,20 @@ constexpr int kMapPad    = 2;                      // keeps the 5x5 marker halo 
 constexpr float kMapRadPerUnit = 0.000218f;        // heading change per (curve unit * metre) = kRoadTurnQ in radians
 
 // ---------------------------------------------------------------------------
-// Car sprite geometry (shared by update() for smoke spawn and render())
+// Car sprite: R34 Skyline GT-R, pre-rasterised at init into monochrome bitmaps
+// at several yaw angles. Left/right are mirrored at init so runtime is two
+// XBM draws (silhouette then body). Smoke / rings use the stored rear-wheel
+// pixel positions for the current angle.
 // ---------------------------------------------------------------------------
 constexpr int kCarCX  = fb::SCREEN_W / 2;
-constexpr int kCarTop = 47;
-constexpr int kCarLevels = 6;
-constexpr int8_t kRearW[kCarLevels] = { 22, 22, 20, 18, 16, 14 };   // rear-face width per slip level
-constexpr int8_t kSideW[kCarLevels] = {  0,  3,  6,  9, 12, 15 };   // visible flank width per slip level
+constexpr int kCarTop = 46;
+constexpr int kCarAngN = 9;                    // 0, 7.5, 15, ... 60 deg
+constexpr int kCarBmpW = 40;                   // bitmap width (even)
+constexpr int kCarBmpH = 18;                   // bitmap height
+constexpr int kCarBmpStride = (kCarBmpW + 7) >> 3;
+constexpr int kCarBmpBytes = kCarBmpStride * kCarBmpH;
+// Angles in degrees for the table (yaw of nose relative to camera).
+constexpr int8_t kCarAngDeg[kCarAngN] = { 0, 8, 15, 22, 30, 38, 45, 52, 60 };
 
 // ---------------------------------------------------------------------------
 // Tables and state
@@ -324,10 +356,9 @@ State    gState;
 int32_t  gSpeedQ;        // Q16.16 km/h
 int32_t  gPlayerXQ;      // Q16.16 road-widths: 0 = centre, +/-1.0 = road edge (+ = right)
 int32_t  gDistQ;         // Q16.16 metres of road progress this run
-int32_t  gThQ;           // Q16.16 deg  nose angle vs road
-int32_t  gPhQ;           // Q16.16 deg  travel direction vs road
-int32_t  gBetaQ;         // Q16.16 deg  slip angle = th - ph (+ = nose right of travel)
-int32_t  gOmQ;           // Q16.16 deg/s yaw rate
+int32_t  gScrollDistQ;   // Q16.16 metres of visual scroll (3x, for stripes/dashes only)
+int32_t  gPhQ;           // Q16.16 deg  travel direction vs road (the car's path)
+int32_t  gBetaQ;         // Q16.16 deg  slip angle: nose relative to travel (+ = nose right) -- the drift angle
 int32_t  gStQ;           // Q16.16 steering position -1..1
 int32_t  gHbQ;           // Q16.16 handbrake level 0..1
 int32_t  gGripQ;         // Q16.16 rear grip 0..1
@@ -342,8 +373,17 @@ uint32_t gWallCoolUs;
 bool     gWallHit;
 bool     gOffroad;
 bool     gSlipFx;        // tyres smoking / marking
-uint8_t  gCarLvl;        // 0..kCarLevels-1 sprite slip level
+uint8_t  gCarAng;        // 0..kCarAngN-1 sprite angle index
 int8_t   gCarDir;        // +1 nose right, -1 nose left
+bool     gBraking;       // DOWN held -> brighter brake lamps
+// Pre-rendered car bitmaps: [angle][0=sil / 1=body], mirrored copies for left.
+uint8_t  gCarSilR[kCarAngN][kCarBmpBytes];
+uint8_t  gCarBodyR[kCarAngN][kCarBmpBytes];
+uint8_t  gCarSilL[kCarAngN][kCarBmpBytes];
+uint8_t  gCarBodyL[kCarAngN][kCarBmpBytes];
+// Rear-wheel centres in bitmap space (for smoke / rings), right-side poses.
+int8_t   gCarWheelX[kCarAngN][2];   // [ang][0=far, 1=near]
+int8_t   gCarWheelY[kCarAngN];
 // scoring
 int32_t  gPrevBetaQ;
 int32_t  gBetaRateQ;     // smoothed |d beta/dt|, deg/s
@@ -379,17 +419,17 @@ uint32_t gBestScore = 0;
 
 // Cached HUD strings (re-formatted only when the value changes).
 constexpr int kBarW = 19;
-char     gSpeedStr[8];
+char     gSpeedStr[12];
 int      gSpeedCache;
-char     gScoreStr[10];
+char     gScoreStr[12];
 uint32_t gScoreCache;
-char     gPendStr[10];
+char     gPendStr[14];
 int32_t  gPendCache;
-char     gMultStr[4];
+char     gMultStr[2];                    // single digit 1..kMultMax
 uint32_t gMultCache;
-char     gAngStr[6];
+char     gAngStr[12];
 int      gAngCache;
-char     gMsgStr[14];
+char     gMsgStr[24];
 
 // ---------------------------------------------------------------------------
 // Small math helpers
@@ -471,6 +511,9 @@ inline int sampleCurve(int32_t posM) {
 // swings sideways in proportion to distance (shear = z * tan(yaw) * px/metre).
 void updateProjection() {
   const int32_t posMod = (gDistQ >> 16) % kTrackLen;
+  // Visual scroll uses a separate 3x counter so stripes/dashes race while
+  // curvature, lap distance and the start line stay on real distance.
+  const int32_t scrollMod = (gScrollDistQ >> 16) % kTrackLen;
   int32_t cv = 0;
   int32_t cx = 0;
   for (int i = kRowsN - 1; i >= 0; --i) {        // bottom (near) -> horizon (far)
@@ -478,6 +521,8 @@ void updateProjection() {
     const int32_t dz = (i == kRowsN - 1) ? z : (z - gRowZ[i + 1]);
     int32_t dist = posMod + z;
     if (dist >= kTrackLen) dist -= kTrackLen;
+    int32_t sdist = scrollMod + z;
+    if (sdist >= kTrackLen) sdist -= kTrackLen;
     const int32_t c = gCurveTbl[dist >> kCurveShift];
     cv += c * dz;
     cx += cv * dz;
@@ -489,8 +534,8 @@ void updateProjection() {
     sx = clampI32(sx, -80, (int32_t)fb::SCREEN_W + 80);       // drawing clamps again
     gRowCX[i] = (int16_t)sx;
     uint8_t fl = 0;
-    if ((dist >> kBandShift) & 1)          fl |= kFlagBand;
-    if (((dist >> kDashShift) & 1) && hw >= 3) fl |= kFlagDash;
+    if ((sdist >> kBandShift) & 1)          fl |= kFlagBand;
+    if (((sdist >> kDashShift) & 1) && hw >= 3) fl |= kFlagDash;
     if (dist < 8)                          fl |= kFlagStart;
     gRowFlags[i] = fl;
   }
@@ -612,7 +657,8 @@ void updateHudStrings() {
   }
   if (gMult != gMultCache) {
     gMultCache = gMult;
-    snprintf(gMultStr, sizeof(gMultStr), "%lu", (unsigned long)gMult);
+    gMultStr[0] = (char)('0' + (int)(gMult > 9 ? 9 : gMult));
+    gMultStr[1] = '\0';
   }
   const int ang = (int)(absI32(gBetaQ) >> 16);
   if (ang != gAngCache) {
@@ -637,19 +683,32 @@ void updateHudStrings() {
 void spawnPuff(int x, int y, int dir) {
   Puff& p = gPuffs[gPuffNext];
   gPuffNext = (uint8_t)((gPuffNext + 1) % kPuffN);
-  p.x = (int32_t)x << 8;
-  p.y = (int32_t)y << 8;
+  p.x = (int32_t)x * 256;
+  p.y = (int32_t)y * 256;
   p.vx = (int8_t)(dir * (int)(6 + (rnd() & 15)));      // px/s, outward
   p.vy = (int8_t)((int)(rnd() & 15) - 12);             // px/s, mostly rising
   p.life = (int32_t)(260000UL + (rnd() & 0x3FFFFUL));  // 260..520 ms
 }
 
-// Screen x of the two rear tyre centres for the current sprite pose.
+// Screen positions of the two rear tyre centres for the current sprite pose.
 inline void tyreXs(int& farX, int& nearX) {
-  const int hw = kRearW[gCarLvl] / 2;
+  const int ang = (int)gCarAng;
   const int dir = gCarDir >= 0 ? 1 : -1;
-  farX  = kCarCX + dir * (-hw + 1);
-  nearX = kCarCX + dir * (hw - 1);
+  // Bitmaps are centred on kCarBmpW/2; wheel coords are relative to bitmap origin.
+  const int baseX = kCarCX - kCarBmpW / 2;
+  const int baseY = kCarTop;
+  if (dir >= 0) {
+    farX  = baseX + gCarWheelX[ang][0];
+    nearX = baseX + gCarWheelX[ang][1];
+  } else {
+    // Mirrored: X flips around bitmap centre
+    farX  = baseX + (kCarBmpW - 1 - gCarWheelX[ang][0]);
+    nearX = baseX + (kCarBmpW - 1 - gCarWheelX[ang][1]);
+  }
+  (void)baseY;  // Y used only for rings / smoke Y
+}
+inline int tyreY() {
+  return kCarTop + gCarWheelY[gCarAng];
 }
 
 void updatePuffs(uint32_t dtUs) {
@@ -668,8 +727,9 @@ void updatePuffs(uint32_t dtUs) {
       int fx, nx;
       tyreXs(fx, nx);
       const int dir = gCarDir >= 0 ? 1 : -1;
-      spawnPuff(fx, kCarTop + 12, -dir);
-      spawnPuff(nx, kCarTop + 12, dir);
+      const int ty = tyreY();
+      spawnPuff(fx, ty, -dir);
+      spawnPuff(nx, ty, dir);
     }
     if (gPuffAccUs > kPuffIntervalUs) gPuffAccUs = kPuffIntervalUs;
   } else {
@@ -770,7 +830,7 @@ void updateScoring(uint32_t dtUs, int32_t dt16) {
         gMultUs = 0;
         gPendQ8 += (kLinkBonus * gMult) << 8;
         if (gPendQ8 > kPendCapQ8) gPendQ8 = kPendCapQ8;
-        char b[14];
+        char b[24];
         snprintf(b, sizeof(b), "LINK x%lu", (unsigned long)gMult);
         showMsg(b);
       }
@@ -808,6 +868,21 @@ void updateScoring(uint32_t dtUs, int32_t dt16) {
 
 // ---------------------------------------------------------------------------
 // Vehicle physics. One call integrates one (sub-)step of dt16 seconds.
+//
+// Two angles, both first-order and both anchored, so nothing can integrate
+// away while no key is held:
+//   phi  (gPhQ)   travel direction vs road. Sideways speed = v*sin(phi).
+//                 phi' = kPath*(phiTarget - phi) - roadTurn*(1 - assist*grip)
+//                        + kSlideTurn*(1 - grip)*beta
+//                 phiTarget = lock * steer * grip: grip steering sets a path angle.
+//   beta (gBetaQ) slip angle, nose vs travel (what you see and score).
+//                 beta' = -kAlign*grip*beta + drive
+//                 drive = tail push (handbrake, power-over)
+//                       + steering into/against the slide (once beta > ~6 deg)
+//                       - line balance (path heading inside the drift trims the angle)
+//                 tapered to zero by ~75 deg so it can't run away.
+// Low grip (handbrake, power-over, a big angle) makes the realignment term
+// small, so beta persists; lifting off / braking restore grip and it decays.
 // ---------------------------------------------------------------------------
 void stepCar(int32_t dt16, bool thr, bool brk, int steerIn, bool hbOn, int32_t curveNow) {
   const bool rec = gRecoverUs > 0;
@@ -815,11 +890,11 @@ void stepCar(int32_t dt16, bool thr, bool brk, int steerIn, bool hbOn, int32_t c
   const int32_t vmsQ = mulQ16(gSpeedQ, kKmhToMsQ);                               // m/s
 
   // steering position and handbrake level ease toward their targets
-  const int32_t stTgt = rec ? 0 : ((int32_t)steerIn << 16);
+  const int32_t stTgt = rec ? 0 : ((int32_t)steerIn * 65536);
   gStQ = approach(gStQ, stTgt, (steerIn == 0 || rec) ? kSteerFallQ : kSteerRiseQ, dt16);
   gHbQ = approach(gHbQ, hbOn ? 65536 : 0, hbOn ? kHbRiseQ : kHbFallQ, dt16);
   const int32_t absSt = absI32(gStQ);
-  const int32_t beta  = gThQ - gPhQ;
+  const int32_t beta  = gBetaQ;
   const int32_t absB  = absI32(beta);
 
   // --- speed: throttle / brake / coast, tyre scrub, handbrake drag ---
@@ -846,37 +921,63 @@ void stepCar(int32_t dt16, bool thr, bool brk, int steerIn, bool hbOn, int32_t c
   const int32_t rhoQ = (int32_t)((int64_t)curveNow * mulQ16(vmsQ, kRoadTurnQ));
 
   // --- rear grip target ---
+  int32_t pw = 0;                                      // power-over level 0..1
   int32_t gT = 65536 - mulQ16(kGripHbQ, gHbQ);
-  if (thr && !brk && !rec) {                           // power-over: throttle + lock at speed
-    const int32_t vf = clampI32((int32_t)(((int64_t)(gSpeedQ - kPowerV0Q) << 16) / (kPowerV1Q - kPowerV0Q)), 0, 65536);
-    const int32_t sf = clampI32((int32_t)(((int64_t)(absSt - kPowerStQ) << 16) / (65536 - kPowerStQ)), 0, 65536);
-    gT -= mulQ16(kGripPowerQ, mulQ16(vf, sf));
+  if (thr && !brk && !rec) {                           // throttle + lock at speed
+    const int32_t vf = ratioQ16(gSpeedQ - kPowerV0Q, kPowerV1Q - kPowerV0Q);
+    const int32_t sf = ratioQ16(absSt - kPowerStQ, 65536 - kPowerStQ);
+    pw = mulQ16(vf, sf);
+    gT -= mulQ16(kGripPowerQ, pw);
   }
-  const int32_t sl = clampI32((int32_t)(((int64_t)(absB - kSlideStartQ) << 16) / kSlideSpanQ), 0, 65536);
+  const int32_t sl = ratioQ16(absB - kSlideStartQ, kSlideSpanQ);
   gT -= mulQ16(kGripSlideQ, sl);                       // big angle -> less grip: the slide persists
   if (!thr) gT += kGripLiftQ;                          // lift off: tyres bite again
   if (brk)  gT += kGripBrakeQ;
   gT = rec ? 65536 : clampI32(gT, kGripMinQ, 65536);
   gGripQ = approach(gGripQ, gT, gT < gGripQ ? kGripFallQ : kGripRiseQ, dt16);
 
-  // --- yaw: steering authority, countersteer, self-alignment ---
-  const int32_t lowF = clampI32((int32_t)(((int64_t)gSpeedQ << 16) / kYawRampKmhQ), 0, 65536);
-  int32_t G = mulQ16(mulQ16(kYawMaxQ, lowF), 65536 - mulQ16(kYawFadeQ, speedFrac));
-  if ((gStQ > 0 && beta < 0) || (gStQ < 0 && beta > 0)) G = mulQ16(G, kCounterQ);   // steering against the slide
-  const int32_t stab = mulQ16(rec ? kRecoverStabQ : kStabQ, gGripQ);
-  const int32_t omT = mulQ16(G, gStQ) + mulQ16(mulQ16(kFollowQ, gGripQ), rhoQ) - mulQ16(stab, beta);
-  gOmQ = clampI32(approach(gOmQ, omT, kYawRespQ, dt16), -kOmMaxQ, kOmMaxQ);
+  // --- slip angle: tail push + steering into / against the slide ---
+  int32_t dirE;                                        // side the tail is pushed toward
+  if (steerIn != 0 && !rec) dirE = steerIn;            // raw input: reacts at once, not via the smoothed position
+  else if (absB > Q(2.0f))  dirE = beta > 0 ? 1 : -1;
+  else                      dirE = curveNow > 0 ? 1 : (curveNow < 0 ? -1 : 0);
+  int32_t D = dirE * (mulQ16(kHbDriveQ, gHbQ) + mulQ16(kPowDriveQ, pw));
+  int32_t gate = ratioQ16(absB - kGateLoQ, kGateSpanQ);
+  const bool counter = (gStQ > 0 && beta < 0) || (gStQ < 0 && beta > 0);   // steering against the slide
+  // Steering authority never drops to zero on a car that has lost grip: against
+  // the slide it keeps a fixed floor (so it can pull the car through zero), into
+  // it the floor scales with lost grip (so a flick can start the opposite slide).
+  const int32_t gateFloor = counter ? kGateFloorQ : mulQ16(kGateFloorQ, 65536 - gGripQ);
+  if (gate < gateFloor) gate = gateFloor;
+  int32_t ds = mulQ16(mulQ16(kSlipSteerQ, gStQ), gate);
+  if (counter) ds = mulQ16(ds, kCounterQ);
+  D += ds;
+  // line balance: if the path heads toward the inside of the drift (phi on the
+  // same side as beta) trim the angle, if it heads outward add some -- this is
+  // what keeps a held slide on the road instead of cutting the corner.
+  if (beta != 0) {
+    const int32_t bal = mulQ16(mulQ16(mulQ16(kLineBalQ, 65536 - gGripQ), gPhQ), ratioQ16(absB - Q(4.0f), Q(8.0f)));
+    D -= bal;                                          // same sign logic for left and right drifts
+  }
+  if ((D > 0 && beta > 0) || (D < 0 && beta < 0)) {    // widening the angle: taper toward ~75 deg
+    D = mulQ16(D, ratioQ16(kTaperEndQ - absB, kTaperSpanQ));
+  }
+  const int32_t align = mulQ16(rec ? kAlignRecQ : kAlignQ, gGripQ);
+  gBetaQ = clampI32(beta + mulQ16(D - mulQ16(align, beta), dt16), -kBetaMaxQ, kBetaMaxQ);
 
-  // --- angles relative to the (rotating) road ---
-  gThQ += mulQ16(gOmQ - rhoQ, dt16);
-  gPhQ += mulQ16(-rhoQ + mulQ16(mulQ16(kTireRateQ, gGripQ), beta), dt16);
+  // --- path: steering target, road push (partly cancelled by grip), slide turn-in ---
+  const int32_t phiMax = mulQ16(kPhiLockQ, 65536 - mulQ16(kPhiFadeQ, speedFrac));
+  const int32_t phiT   = mulQ16(mulQ16(phiMax, gStQ), gGripQ);
+  const int32_t rhoE   = mulQ16(rhoQ, 65536 - mulQ16(kRoadAssistQ, gGripQ));
+  const int32_t turnIn = mulQ16(mulQ16(kSlideTurnQ, 65536 - gGripQ), beta);
+  gPhQ += mulQ16(mulQ16(kPathRateQ, phiT - gPhQ) - rhoE + turnIn, dt16);
   gPhQ = clampI32(gPhQ, -kPhMaxQ, kPhMaxQ);
-  gThQ = clampI32(gThQ, gPhQ - kBetaMaxQ, gPhQ + kBetaMaxQ);
-  gBetaQ = gThQ - gPhQ;
 
   // --- position: sideways motion = v*sin(phi), progress = v*cos(phi) ---
   gPlayerXQ += mulQ16(mulQ16(vmsQ, sinDegQ(gPhQ)), dt16) / kRoadHalfM;
-  gDistQ    += mulQ16(mulQ16(vmsQ, cosDegQ(gPhQ)), dt16);
+  const int32_t dProg = mulQ16(mulQ16(vmsQ, cosDegQ(gPhQ)), dt16);
+  gDistQ       += dProg;
+  gScrollDistQ += mulQ16(dProg, kScrollMulQ);   // 3x visual scroll for stripes/dashes
 
   // --- soft barrier ---
   if (gPlayerXQ > kPlayerXMaxQ || gPlayerXQ < -kPlayerXMaxQ) {
@@ -897,12 +998,12 @@ void stepCar(int32_t dt16, bool thr, bool brk, int steerIn, bool hbOn, int32_t c
 // Run lifecycle
 // ---------------------------------------------------------------------------
 void resetRun() {
-  gSpeedQ = 0; gPlayerXQ = 0; gDistQ = 0; gLeanQ = 0;
-  gThQ = 0; gPhQ = 0; gBetaQ = 0; gOmQ = 0; gStQ = 0; gHbQ = 0;
+  gSpeedQ = 0; gPlayerXQ = 0; gDistQ = 0; gScrollDistQ = 0; gLeanQ = 0;
+  gPhQ = 0; gBetaQ = 0; gStQ = 0; gHbQ = 0;
   gGripQ = 65536; gCamQ = 0; gShearQ = 0;
   gHbHeldUs = 0; gHbFlashUs = 0; gSpinUs = 0; gRecoverUs = 0; gWallCoolUs = 0;
   gWallHit = false; gOffroad = false; gSlipFx = false;
-  gCarLvl = 0; gCarDir = 1;
+  gCarAng = 0; gCarDir = 1; gBraking = false;
   gPrevBetaQ = 0; gBetaRateQ = 0;
   gDrifting = false; gChain = false; gLastDir = 1; gDriftHoldUs = 0; gGraceUs = 0;
   gMult = 1; gMultUs = 0; gPendQ8 = 0; gScore = 0;
@@ -919,11 +1020,268 @@ void resetRun() {
   updateHudStrings();
 }
 
+// ---------------------------------------------------------------------------
+// R34 Skyline GT-R sprite rasteriser (init only, float OK).
+// Parametric rear 3/4 model: boxy body, flared arches, four round tail lamps,
+// rear wing on posts, twin exhaust tips. Projected from a camera behind and
+// slightly above, then stored as monochrome XBM (silhouette + body).
+// ---------------------------------------------------------------------------
+inline void carSet(uint8_t* bits, int x, int y) {
+  if (x < 0 || y < 0 || x >= kCarBmpW || y >= kCarBmpH) return;
+  bits[y * kCarBmpStride + (x >> 3)] |= (uint8_t)(1u << (x & 7));
+}
+inline void carClear(uint8_t* bits, int x, int y) {
+  if (x < 0 || y < 0 || x >= kCarBmpW || y >= kCarBmpH) return;
+  bits[y * kCarBmpStride + (x >> 3)] &= (uint8_t)~(1u << (x & 7));
+}
+inline bool carGet(const uint8_t* bits, int x, int y) {
+  if (x < 0 || y < 0 || x >= kCarBmpW || y >= kCarBmpH) return false;
+  return (bits[y * kCarBmpStride + (x >> 3)] & (1u << (x & 7))) != 0;
+}
+
+void buildCarSprites() {
+  const float halfW = 1.05f;
+  const float halfH = 0.55f;
+  const float bodyL = 2.40f;
+  const float cabinH = 0.95f;
+  const float wingH = 1.15f;
+  const float wingW = 1.15f;
+  const float archW = 1.25f;
+  const float wheelY = -0.15f;
+
+  for (int ai = 0; ai < kCarAngN; ++ai) {
+    const float yaw = (float)kCarAngDeg[ai] * 0.017453293f;
+    const float cy = cosf(yaw), sy = sinf(yaw);
+    const float camZ = -4.2f, camY = 1.8f;
+    const float foc = 28.0f;
+
+    uint8_t sil[kCarBmpBytes];
+    uint8_t body[kCarBmpBytes];
+    for (int i = 0; i < kCarBmpBytes; ++i) { sil[i] = 0; body[i] = 0; }
+
+    auto project = [&](float x, float y, float z, int& ox, int& oy) {
+      float rx = x * cy + z * sy;
+      float rz = -x * sy + z * cy;
+      float ry = y;
+      float dx = rx;
+      float dy = ry - camY;
+      float dz = rz - camZ;
+      if (dz < 0.4f) dz = 0.4f;
+      ox = (int)(kCarBmpW / 2 + foc * dx / dz + 0.5f);
+      oy = (int)(kCarBmpH / 2 + foc * dy / dz + 0.5f);
+    };
+
+    auto fillQuad = [&](uint8_t* dst, float ax, float ay, float az,
+                        float bx, float by, float bz,
+                        float cx, float cy_, float cz,
+                        float dx, float dy, float dz, bool solid) {
+      int pa[4][2];
+      project(ax, ay, az, pa[0][0], pa[0][1]);
+      project(bx, by, bz, pa[1][0], pa[1][1]);
+      project(cx, cy_, cz, pa[2][0], pa[2][1]);
+      project(dx, dy, dz, pa[3][0], pa[3][1]);
+      int minx = pa[0][0], maxx = pa[0][0], miny = pa[0][1], maxy = pa[0][1];
+      for (int i = 1; i < 4; ++i) {
+        if (pa[i][0] < minx) minx = pa[i][0];
+        if (pa[i][0] > maxx) maxx = pa[i][0];
+        if (pa[i][1] < miny) miny = pa[i][1];
+        if (pa[i][1] > maxy) maxy = pa[i][1];
+      }
+      minx = clampI32(minx, 0, kCarBmpW - 1);
+      maxx = clampI32(maxx, 0, kCarBmpW - 1);
+      miny = clampI32(miny, 0, kCarBmpH - 1);
+      maxy = clampI32(maxy, 0, kCarBmpH - 1);
+      for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+          bool inside = true;
+          for (int i = 0; i < 4; ++i) {
+            int j = (i + 1) % 4;
+            int cross = (pa[j][0] - pa[i][0]) * (y - pa[i][1]) - (pa[j][1] - pa[i][1]) * (x - pa[i][0]);
+            if (cross < 0) { inside = false; break; }
+          }
+          if (inside) {
+            carSet(sil, x, y);
+            if (solid) carSet(dst, x, y);
+          }
+        }
+      }
+    };
+
+    // Rear face
+    fillQuad(body, -halfW, -halfH, 0, halfW, -halfH, 0, halfW, halfH, 0, -halfW, halfH, 0, true);
+
+    // Side face (dithered)
+    {
+      int pa[4][2];
+      project( halfW, -halfH, 0, pa[0][0], pa[0][1]);
+      project( halfW * 0.7f, -halfH, bodyL, pa[1][0], pa[1][1]);
+      project( halfW * 0.7f,  halfH, bodyL, pa[2][0], pa[2][1]);
+      project( halfW,  halfH, 0, pa[3][0], pa[3][1]);
+      int minx = pa[0][0], maxx = pa[0][0], miny = pa[0][1], maxy = pa[0][1];
+      for (int i = 1; i < 4; ++i) {
+        if (pa[i][0] < minx) minx = pa[i][0];
+        if (pa[i][0] > maxx) maxx = pa[i][0];
+        if (pa[i][1] < miny) miny = pa[i][1];
+        if (pa[i][1] > maxy) maxy = pa[i][1];
+      }
+      minx = clampI32(minx, 0, kCarBmpW - 1);
+      maxx = clampI32(maxx, 0, kCarBmpW - 1);
+      miny = clampI32(miny, 0, kCarBmpH - 1);
+      maxy = clampI32(maxy, 0, kCarBmpH - 1);
+      for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+          bool inside = true;
+          for (int i = 0; i < 4; ++i) {
+            int j = (i + 1) % 4;
+            int cross = (pa[j][0] - pa[i][0]) * (y - pa[i][1]) - (pa[j][1] - pa[i][1]) * (x - pa[i][0]);
+            if (cross < 0) { inside = false; break; }
+          }
+          if (inside) {
+            carSet(sil, x, y);
+            if (((x + y) & 1) == 0) carSet(body, x, y);
+          }
+        }
+      }
+    }
+
+    // Cabin
+    fillQuad(body, -halfW * 0.75f, halfH, 0.15f, halfW * 0.75f, halfH, 0.15f,
+             halfW * 0.55f, cabinH, 0.9f, -halfW * 0.55f, cabinH, 0.9f, true);
+    // Glass cut-out
+    {
+      int pa[4][2];
+      project(-halfW * 0.65f, halfH + 0.08f, 0.25f, pa[0][0], pa[0][1]);
+      project( halfW * 0.65f, halfH + 0.08f, 0.25f, pa[1][0], pa[1][1]);
+      project( halfW * 0.50f, cabinH - 0.05f, 0.85f, pa[2][0], pa[2][1]);
+      project(-halfW * 0.50f, cabinH - 0.05f, 0.85f, pa[3][0], pa[3][1]);
+      int minx = pa[0][0], maxx = pa[0][0], miny = pa[0][1], maxy = pa[0][1];
+      for (int i = 1; i < 4; ++i) {
+        if (pa[i][0] < minx) minx = pa[i][0];
+        if (pa[i][0] > maxx) maxx = pa[i][0];
+        if (pa[i][1] < miny) miny = pa[i][1];
+        if (pa[i][1] > maxy) maxy = pa[i][1];
+      }
+      for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+          bool inside = true;
+          for (int i = 0; i < 4; ++i) {
+            int j = (i + 1) % 4;
+            int cross = (pa[j][0] - pa[i][0]) * (y - pa[i][1]) - (pa[j][1] - pa[i][1]) * (x - pa[i][0]);
+            if (cross < 0) { inside = false; break; }
+          }
+          if (inside) carClear(body, x, y);
+        }
+      }
+    }
+
+    // Rear wing blade
+    fillQuad(body, -wingW, wingH - 0.08f, -0.05f, wingW, wingH - 0.08f, -0.05f,
+             wingW, wingH, -0.05f, -wingW, wingH, -0.05f, true);
+    // Posts
+    for (float sx : {-0.55f, 0.55f}) {
+      int x0, y0, x1, y1;
+      project(sx, halfH, 0.05f, x0, y0);
+      project(sx, wingH - 0.08f, -0.02f, x1, y1);
+      int steps = absI32(y1 - y0) + absI32(x1 - x0) + 1;
+      for (int s = 0; s <= steps; ++s) {
+        int px = x0 + (x1 - x0) * s / steps;
+        int py = y0 + (y1 - y0) * s / steps;
+        carSet(sil, px, py); carSet(body, px, py);
+        carSet(sil, px + 1, py); carSet(body, px + 1, py);
+      }
+    }
+
+    // Four round tail lamps
+    const float lampXs[4] = {-0.72f, -0.38f, 0.38f, 0.72f};
+    for (int li = 0; li < 4; ++li) {
+      int lx, ly;
+      project(lampXs[li], 0.15f, 0.02f, lx, ly);
+      for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx)
+          if (dx * dx + dy * dy <= 4) carClear(body, lx + dx, ly + dy);
+      for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx)
+          if (dx * dx + dy * dy <= 4 && dx * dx + dy * dy >= 2) {
+            carSet(sil, lx + dx, ly + dy);
+            carSet(body, lx + dx, ly + dy);
+          }
+    }
+
+    // Twin exhaust tips
+    for (float ex : {-0.25f, 0.25f}) {
+      int exx, exy;
+      project(ex, -halfH + 0.08f, -0.02f, exx, exy);
+      carSet(sil, exx, exy); carSet(sil, exx + 1, exy);
+      carClear(body, exx, exy); carClear(body, exx + 1, exy);
+    }
+
+    // Rear wheels
+    int wlx, wly, wrx, wry;
+    project(-archW + 0.15f, wheelY, 0.15f, wlx, wly);
+    project( archW - 0.15f, wheelY, 0.15f, wrx, wry);
+    gCarWheelX[ai][0] = (int8_t)wlx;
+    gCarWheelX[ai][1] = (int8_t)wrx;
+    gCarWheelY[ai] = (int8_t)((wly + wry) / 2);
+    for (int wi = 0; wi < 2; ++wi) {
+      int wx = (wi == 0) ? wlx : wrx;
+      int wy = (wi == 0) ? wly : wry;
+      for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
+          if (dx * dx + dy * dy <= 9) {
+            carSet(sil, wx + dx, wy + dy);
+            if (dx * dx + dy * dy <= 4) carClear(body, wx + dx, wy + dy);
+            else carSet(body, wx + dx, wy + dy);
+          }
+        }
+    }
+
+    // Front wheel (3/4 views)
+    if (ai >= 2) {
+      int fwx, fwy;
+      project(halfW * 0.55f, wheelY, bodyL * 0.85f, fwx, fwy);
+      for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx)
+          if (dx * dx + dy * dy <= 5) {
+            carSet(sil, fwx + dx, fwy + dy);
+            if (dx * dx + dy * dy <= 2) carClear(body, fwx + dx, fwy + dy);
+            else carSet(body, fwx + dx, fwy + dy);
+          }
+    }
+
+    // Outline expand
+    uint8_t outline[kCarBmpBytes];
+    for (int i = 0; i < kCarBmpBytes; ++i) outline[i] = 0;
+    for (int y = 0; y < kCarBmpH; ++y) {
+      for (int x = 0; x < kCarBmpW; ++x) {
+        if (!carGet(sil, x, y)) continue;
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx)
+            carSet(outline, x + dx, y + dy);
+      }
+    }
+    for (int i = 0; i < kCarBmpBytes; ++i) {
+      gCarSilR[ai][i] = outline[i];
+      gCarBodyR[ai][i] = body[i];
+      gCarSilL[ai][i] = 0;
+      gCarBodyL[ai][i] = 0;
+    }
+    // Mirror left
+    for (int y = 0; y < kCarBmpH; ++y) {
+      for (int x = 0; x < kCarBmpW; ++x) {
+        int mx = kCarBmpW - 1 - x;
+        if (carGet(outline, x, y)) carSet(gCarSilL[ai], mx, y);
+        if (carGet(body, x, y))    carSet(gCarBodyL[ai], mx, y);
+      }
+    }
+  }
+}
+
 void gameInit() {
   for (int i = 0; i <= 90; ++i)                        // sine table (init-only float)
     gSinTbl[i] = (int16_t)(sinf((float)i * 0.017453293f) * 32767.0f + 0.5f);
   buildCurveTable();
   buildMap();
+  buildCarSprites();
   for (int i = 0; i < kRowsN; ++i) {
     const int dy = i + 1;                              // y = kHorizonY + dy
     gRowZ[i]  = (int16_t)(kProjC / dy);                // metres ahead of the car
@@ -1015,11 +1373,12 @@ fb::Status gameUpdate(const fb::Input& in, const fb::Frame& f) {
       // upcoming corner when no steering is held
       if ((in.pressed & fb::KEY_X) && hbOn) {
         const int dir = steer != 0 ? steer : (curveNow > 0 ? 1 : (curveNow < 0 ? -1 : 0));
-        gOmQ += dir * kHbKickQ;
+        gBetaQ = clampI32(gBetaQ + dir * kHbKickQ, -kBetaMaxQ, kBetaMaxQ);
         gHbFlashUs = kHbFlashUs;
         int fx, nx;
         tyreXs(fx, nx);
-        for (int i = 0; i < 3; ++i) { spawnPuff(fx, kCarTop + 12, -1); spawnPuff(nx, kCarTop + 12, 1); }
+        const int ty = tyreY();
+        for (int i = 0; i < 3; ++i) { spawnPuff(fx, ty, -1); spawnPuff(nx, ty, 1); }
       }
 
       // --- physics: 1 step, or 2 if the frame was long (bounded cost) ---
@@ -1030,15 +1389,18 @@ fb::Status gameUpdate(const fb::Input& in, const fb::Frame& f) {
       // --- scoring, camera, effects ---
       updateScoring(dtUs, dt16);
 
-      gCamQ = approach(gCamQ, clampI32(gThQ, -kCamMaxQ, kCamMaxQ), kCamRateQ, dt16);
+      gCamQ = approach(gCamQ, clampI32(gPhQ + gBetaQ, -kCamMaxQ, kCamMaxQ), kCamRateQ, dt16);   // view follows the nose
       gShearQ = mulQ16(sinDegQ(gCamQ), kCamFollowQ);
       gLeanQ  = approach(gLeanQ, gStQ * 2, Q(8.0f), dt16);
 
       const int32_t absB = absI32(gBetaQ);
-      int lvl = (int)((absB >> 16) / 10);
-      if (lvl > kCarLevels - 1) lvl = kCarLevels - 1;
-      gCarLvl = (uint8_t)lvl;
+      // Map absolute slip angle to sprite table (0..60 deg -> 0..kCarAngN-1)
+      int ang = (int)((absB >> 16) * (kCarAngN - 1) / 60);
+      if (ang > kCarAngN - 1) ang = kCarAngN - 1;
+      if (ang < 0) ang = 0;
+      gCarAng = (uint8_t)ang;
       if (gBetaQ > Q(1.0f)) gCarDir = 1; else if (gBetaQ < -Q(1.0f)) gCarDir = -1;
+      gBraking = brk;
       gSlipFx = (!gOffroad && absB >= Q(10.0f) && gSpeedQ >= Q(25.0f)) || (gOffroad && gSpeedQ >= Q(20.0f));
       updatePuffs(dtUs);
 
@@ -1116,36 +1478,33 @@ inline void dbox(U8G2& d, int cx, int dir, int xo, int w, int y, int h) {
   box(d, dir >= 0 ? cx + xo : cx - xo - w, y, w, h);
 }
 
-// Drift car seen from behind: rear face plus a flank that grows on the nose
-// side as the slip angle increases (lvl 0 = straight, 5 = ~50+ deg), the rear
-// face narrowing as it turns away. One dark halo box keeps it crisp on the road.
-void drawCar(U8G2& d, int cx, int top, int lvl, int dir, int lean, bool jitter) {
+// R34 GT-R: two XBM draws (black silhouette then white body). Angle from
+// slip; left/right from mirrored tables. Optional 1 px vertical jitter when
+// off-road / smoking. Brake lamps are part of the body bitmap; when braking
+// we overdraw brighter dots on the four lamp centres.
+void drawCar(U8G2& d, int cx, int top, int ang, int dir, bool jitter) {
   if (jitter) top += (int)((gAnimMs >> 5) & 1u);
-  const int rw = kRearW[lvl];
-  const int hw = rw / 2;
-  const int sw = kSideW[lvl];
-  const int cab = (sw >> 2) + lean;                    // cabin leans toward the nose and with steering
-
-  d.setDrawColor(0);                                   // halo
-  dbox(d, cx, dir, -hw - 2, rw + sw + 4, top - 1, 15);
-  d.setDrawColor(1);
-  dbox(d, cx, dir, -hw - 1, 4, top + 7, 6);            // far rear tyre
-  dbox(d, cx, dir, hw - 3, 4, top + 7, 6);             // near rear tyre
-  dbox(d, cx, dir, -hw + 3, rw - 6, top + 3, 7);       // rear body
-  dbox(d, cx, dir, -hw + 6 + cab, rw - 12 + (sw >> 1), top, 3);   // cabin
-  dbox(d, cx, dir, -4, 8, top + 10, 2);                // rear bumper
+  if (ang < 0) ang = 0;
+  if (ang >= kCarAngN) ang = kCarAngN - 1;
+  const int bx = cx - kCarBmpW / 2;
+  const uint8_t* sil  = (dir >= 0) ? gCarSilR[ang]  : gCarSilL[ang];
+  const uint8_t* body = (dir >= 0) ? gCarBodyR[ang] : gCarBodyL[ang];
+  d.setBitmapMode(0);
   d.setDrawColor(0);
-  dbox(d, cx, dir, -hw + 7 + cab, rw - 14 + (sw >> 1), top + 1, 1);   // rear window slit
-  dbox(d, cx, dir, -hw + 4, 3, top + 5, 1);            // tail lights
-  dbox(d, cx, dir, hw - 7, 3, top + 5, 1);
+  d.drawXBM((u8g2_uint_t)bx, (u8g2_uint_t)top,
+            (u8g2_uint_t)kCarBmpW, (u8g2_uint_t)kCarBmpH, sil);
   d.setDrawColor(1);
-  if (sw > 0) {                                        // flank on the nose side
-    dbox(d, cx, dir, hw - 4, sw + 4, top + 4, 6);
-    dbox(d, cx, dir, hw + sw - 3, 4, top + 6, 5);      // front tyre (smaller, farther)
-    if (sw >= 6) {
-      d.setDrawColor(0);
-      dbox(d, cx, dir, hw + 1, sw - 3, top + 5, 1);    // side window
-      d.setDrawColor(1);
+  d.drawXBM((u8g2_uint_t)bx, (u8g2_uint_t)top,
+            (u8g2_uint_t)kCarBmpW, (u8g2_uint_t)kCarBmpH, body);
+  // Brake lamps: four bright pixels near the rear face when braking
+  if (gBraking) {
+    // Approximate lamp positions from the 0-deg pose (close enough at all angles)
+    const int ly = top + gCarWheelY[0] - 4;
+    const int centres[4] = { -9, -4, 4, 9 };
+    for (int i = 0; i < 4; ++i) {
+      int lx = cx + ((dir >= 0) ? centres[i] : -centres[i]);
+      d.drawPixel((u8g2_uint_t)lx, (u8g2_uint_t)ly);
+      d.drawPixel((u8g2_uint_t)(lx + 1), (u8g2_uint_t)ly);
     }
   }
 }
@@ -1183,12 +1542,14 @@ void renderWorld(U8G2& d) {
   }
 
   // skid marks under the rear tyres (flicker reads as dashed marks)
-  const int lvl = (int)gCarLvl;
+  const int ang = (int)gCarAng;
   const int dir = (int)gCarDir;
   if (gSlipFx && ((gAnimMs >> 6) & 1u)) {
-    const int hw = kRearW[lvl] / 2;
-    dbox(d, kCarCX, dir, -hw - 1, 4, kCarTop + 14, 2);
-    dbox(d, kCarCX, dir, hw - 3, 4, kCarTop + 14, 2);
+    int fx, nx;
+    tyreXs(fx, nx);
+    const int ty = tyreY() + 2;
+    box(d, fx - 1, ty, 3, 2);
+    box(d, nx - 1, ty, 3, 2);
   }
 
   // smoke / dust puffs
@@ -1203,15 +1564,16 @@ void renderWorld(U8G2& d) {
   }
 
   // player car: fixed near bottom-centre, the road slides beneath it
-  drawCar(d, kCarCX, kCarTop, lvl, dir, (int)(gLeanQ >> 16), gSlipFx && gOffroad);
+  drawCar(d, kCarCX, kCarTop, ang, dir, gSlipFx && gOffroad);
 
   // handbrake rings at the rear tyres
   if (gHbFlashUs > 0) {
     int fx, nx;
     tyreXs(fx, nx);
+    const int ty = tyreY();
     const int r = 2 + (int)((kHbFlashUs - gHbFlashUs) / 70000UL);
-    d.drawCircle((u8g2_uint_t)fx, (u8g2_uint_t)(kCarTop + 10), (u8g2_uint_t)r);
-    d.drawCircle((u8g2_uint_t)nx, (u8g2_uint_t)(kCarTop + 10), (u8g2_uint_t)r);
+    d.drawCircle((u8g2_uint_t)fx, (u8g2_uint_t)ty, (u8g2_uint_t)r);
+    d.drawCircle((u8g2_uint_t)nx, (u8g2_uint_t)ty, (u8g2_uint_t)r);
   }
 }
 
@@ -1293,7 +1655,7 @@ void renderHud(U8G2& d) {
   d.drawStr((u8g2_uint_t)((int)fb::SCREEN_W - 2 - w), 20, gScoreStr);
   if (gChain && gPendQ8 > 0) {           // unbanked points of the current chain
     w = (int)d.getStrWidth(gPendStr);
-    d.drawStr((u8g2_uint_t)((int)fb::SCREEN_W - 2 - w), 31, gPendStr);
+    d.drawStr((u8g2_uint_t)((int)fb::SCREEN_W - 2 - w), 35, gPendStr);
   }
   renderMap(d);
   renderComboPanel(d);
@@ -1337,7 +1699,7 @@ void renderTitle(U8G2& d) {
   centerStr(d, 19, "2 FAST 2 FURIOUS");
   d.setFont(u8g2_font_5x7_tr);
   centerStr(d, 27, "flipBOX DRIFT SIM");
-  drawCar(d, fb::SCREEN_W / 2, 29, 3, ((gAnimMs / 1400UL) & 1UL) ? -1 : 1, 0, false);   // sliding both ways
+  drawCar(d, fb::SCREEN_W / 2, 28, 4, ((gAnimMs / 1400UL) & 1UL) ? -1 : 1, false);   // sliding both ways
   d.setFont(u8g2_font_5x7_tr);
   centerStr(d, 49, "UP=GAS  DOWN=BRAKE");
   centerStr(d, 56, "X=HANDBRAKE  L/R=STEER");
@@ -1391,7 +1753,7 @@ void renderResult(U8G2& d) {
   d.setFontMode(0);
   d.setFont(u8g2_font_7x13B_tr);
   centerStr(d, 11, "RUN COMPLETE");
-  char buf[28];
+  char buf[48];
   d.setFont(u8g2_font_6x10_tr);
   snprintf(buf, sizeof(buf), "SCORE %lu", (unsigned long)gScore);
   d.drawStr(4, 23, buf);
