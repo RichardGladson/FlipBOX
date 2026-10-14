@@ -1,50 +1,22 @@
 /*
  * ============================================================================
- *  flipBOX  --  Launcher  (main.cpp, Wave 1)
+ *  flipBOX  --  Launcher  (main.cpp, Wave 1)  +  Options / Settings
  *  ESP32-WROOM-32 | Arduino | PlatformIO | U8g2 | SSD1306 128x64 I2C | 6 keys
  * ============================================================================
  *
  *  FLOW
- *     boot -> game-selection menu -> selected game -> (game exits) -> menu
+ *     boot -> [password gate if enabled] -> game-selection menu
+ *           -> (hold UP 1s) -> options menu
+ *           -> selected game -> (game exits) -> menu
  *
- *  ADDING A GAME  (three steps, one line in this file)
- *     1. Create src/NewGame.cpp.
- *     2. Paste the "FLIPBOX GAME CONTRACT" block below (between its BEGIN/END
- *        markers) at the top of that file and implement:
- *            static void           gameInit();                       // optional
- *            static fb::Status     gameUpdate(const fb::Input&, const fb::Frame&);
- *            static void           gameRender(U8G2& d);
- *            static void           gameShutdown();                   // optional
- *        then end the file with:
- *            FB_GAME(NewGame, gameInit, gameUpdate, gameRender, gameShutdown);
- *        (pass nullptr for init / shutdown if unused).
- *     3. Add ONE line to FB_GAME_LIST below:   X(NewGame, "Menu Label")
+ *  OPTIONS (hold UP 1s on main menu; hold DOWN 1s to leave options)
+ *     1. Brightness   – 1 % … 100 % (never fully black)
+ *     2. Password     – require UP-DOWN-UP-DOWN on every boot
+ *     3. Airplane     – cosmetic toggle only
+ *     4. Troll Mode   – screen becomes cracky / flaky; hold SELECT 4 s to kill
+ *     5 / 6. (blank – hoverable, not selectable)
  *
- *  The launcher links against each game through a weak symbol, so this file
- *  compiles and runs even while a game's .cpp does not exist yet; selecting a
- *  missing game shows "NOT INSTALLED".
- *
- *  PER-FRAME ORDER IN A GAME:   input poll -> update() -> clear -> render()
- *                               -> present (asynchronous, see below)
- *
- *  PERFORMANCE NOTES
- *     * No delay(), no heap allocation, no String, no framework object churn.
- *     * Frame rate is NOT capped: the loop runs as fast as the OLED bus allows.
- *     * The 1 KB frame is pushed to the OLED by a small task on core 0 while
- *       core 1 already computes the next frame (set FB_ASYNC_DISPLAY 0 to fall
- *       back to a plain, synchronous sendBuffer()).
- *     * FB_FAST_FLUSH: that task streams the frame as a few long I2C writes
- *       (window set once, horizontal addressing) instead of U8g2's tile-by-tile
- *       transfers.  Set it to 0 to use the stock U8g2 tile path.
- *     * FB_LATE_LATCH: the game loop waits until the OLED link is nearly idle
- *       and only THEN samples input / runs update() / render(), so the frame
- *       shown reflects the newest possible button state.  Throughput is kept
- *       because the wait is sized from the measured update+render time.
- *     * Buttons are read straight from the GPIO input registers, additionally
- *       sampled every 1 ms by an esp_timer callback.  Every accepted edge is
- *       time-stamped and latched, so taps shorter than a frame are never lost
- *       and games can ask for the exact press time (see "LAUNCHER EXTRAS").
- *     * The menu only redraws when something changed.
+ *  All settings live in NVS (Preferences) so they survive power cycles.
  * ============================================================================
  */
 
@@ -57,72 +29,57 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <Preferences.h>
 
 // ============================================================================
 //  1. BUILD OPTIONS (override with -D in platformio.ini if you like)
 // ============================================================================
 #ifndef FB_I2C_HZ
-#define FB_I2C_HZ 1000000UL     // OLED bus clock. 400000 = safe default of most
-                                // modules; 1000000+ = faster (needs decent
-                                // pull-ups and short wires). Lower it if the
-                                // screen shows noise/garbage.
+#define FB_I2C_HZ 1000000UL
 #endif
 #ifndef FB_ASYNC_DISPLAY
-#define FB_ASYNC_DISPLAY 1      // 1 = push frames to the OLED from core 0
+#define FB_ASYNC_DISPLAY 1
 #endif
 #ifndef FB_SHOW_FPS
-#define FB_SHOW_FPS 0           // 1 = small FPS counter (top-right) inside games
+#define FB_SHOW_FPS 0
 #endif
 #ifndef FB_DEBOUNCE_US
-#define FB_DEBOUNCE_US 5000UL   // lock-out after a button edge (first edge is
-                                // accepted with zero latency)
+#define FB_DEBOUNCE_US 5000UL
 #endif
 #ifndef FB_MAX_DT_US
-#define FB_MAX_DT_US 50000UL    // frame delta handed to games is clamped to this
+#define FB_MAX_DT_US 50000UL
 #endif
 #ifndef FB_FAST_FLUSH
-#define FB_FAST_FLUSH 1         // 1 = stream the frame as long I2C writes from the
-                                // flush task (needs FB_ASYNC_DISPLAY 1);
-                                // 0 = stock U8g2 tile transfers
+#define FB_FAST_FLUSH 1
 #endif
 #ifndef FB_I2C_CHUNK
-#define FB_I2C_CHUNK 256        // data bytes per I2C write in the fast flush
-                                // (power of two <= 1024; reduced automatically
-                                // if the Wire buffer cannot grow that far)
+#define FB_I2C_CHUNK 256
 #endif
 #ifndef FB_LATE_LATCH
-#define FB_LATE_LATCH 1         // 1 = start each frame as late as possible so the
-                                // newest input is shown (needs FB_ASYNC_DISPLAY 1)
+#define FB_LATE_LATCH 1
 #endif
 #ifndef FB_LATCH_MARGIN_US
-#define FB_LATCH_MARGIN_US 400UL // safety slack added to the measured frame work time
+#define FB_LATCH_MARGIN_US 400UL
 #endif
 #ifndef FB_PANEL_LATENCY_US
-#define FB_PANEL_LATENCY_US 5000UL // average delay between the last byte reaching the
-                                // OLED and the pixels lighting up (~half a panel
-                                // scan). Only used for the latency estimate that
-                                // games can query.
+#define FB_PANEL_LATENCY_US 5000UL
 #endif
 #ifndef FB_OLED_OSC
-#define FB_OLED_OSC 0xF0        // SSD1306 display clock (cmd 0xD5): 0xF0 = fastest
-                                // panel refresh (less scan-out delay / tearing).
-                                // 0x80 = controller default, 0 = do not touch.
-                                // If the picture flickers or looks dim, set 0.
+#define FB_OLED_OSC 0xF0
 #endif
 
 // ============================================================================
 //  2. GAME REGISTRY  --  ONE line per game:  X(symbol, "menu label")
-//     'symbol' must match the id used in that game's FB_GAME(...) line.
 // ============================================================================
 #define FB_GAME_LIST(X)                                    \
   X(F1Racing,       "F1 Racing")                           \
   X(FastAndFurious, "Fast and Furious")                    \
-  X(TokyoDrift,     "Tokyo Drift") \
-  X(TwoFast2Furious, "2 Fast 2 Furious")
+  X(TokyoDrift,     "Tokyo Drift")                         \
+  X(TwoFast2Furious, "2 Fast 2 Furious") \
+  X(HillClimb, "Hill Climb Racing")
+
 // ============================================================================
 //  3. FLIPBOX GAME CONTRACT v1
-//     Paste everything between BEGIN and END, unchanged, at the top of every
-//     game .cpp (plus the two #includes). Identical copies are ODR-safe.
 // ============================================================================
 // ----- FLIPBOX GAME CONTRACT v1 : BEGIN ------------------------------------
 #include <Arduino.h>
@@ -133,7 +90,6 @@ namespace fb {
 constexpr uint8_t SCREEN_W = 128;
 constexpr uint8_t SCREEN_H = 64;
 
-// Button masks (used in Input::held / pressed / released)
 constexpr uint8_t KEY_UP     = 1u << 0;
 constexpr uint8_t KEY_DOWN   = 1u << 1;
 constexpr uint8_t KEY_LEFT   = 1u << 2;
@@ -141,71 +97,49 @@ constexpr uint8_t KEY_RIGHT  = 1u << 3;
 constexpr uint8_t KEY_SELECT = 1u << 4;
 constexpr uint8_t KEY_X      = 1u << 5;
 
-// Debounced input, identical for every game. Buttons that were still held when
-// the game was entered stay invisible here until they are physically released.
 struct Input {
-  uint8_t held;      // currently down
-  uint8_t pressed;   // went down  since the previous update()
-  uint8_t released;  // went up    since the previous update()
+  uint8_t held;
+  uint8_t pressed;
+  uint8_t released;
 };
 
-// Timing, refreshed before every update().
 struct Frame {
-  uint32_t nowMs;    // millis()
-  uint32_t dtUs;     // microseconds since previous frame (clamped, never 0 after frame 0)
-  uint32_t index;    // frames since the game was entered (0 on the first one)
-  uint16_t fps;      // measured frames/second, refreshed twice per second
+  uint32_t nowMs;
+  uint32_t dtUs;
+  uint32_t index;
+  uint16_t fps;
 };
 
 enum Status : uint8_t { GAME_RUN = 0, GAME_EXIT = 1 };
 
-// What every game exports.
 struct Game {
-  void   (*init)();                                        // once on entry (nullptr ok)
-  Status (*update)(const Input& in, const Frame& f);       // return GAME_EXIT -> back to menu
-  void   (*render)(U8G2& d);                               // draw only; buffer is cleared before
-  void   (*shutdown)();                                    // once on exit (nullptr ok)
+  void   (*init)();
+  Status (*update)(const Input& in, const Frame& f);
+  void   (*render)(U8G2& d);
+  void   (*shutdown)();
 };
 
 }  // namespace fb
 
-// Put as the last line of a game file.  'id' is the symbol used in FB_GAME_LIST.
 #define FB_GAME(id, initFn, updateFn, renderFn, shutdownFn)                    \
   extern const fb::Game fbGame_##id;                                           \
   const fb::Game fbGame_##id = { initFn, updateFn, renderFn, shutdownFn }
 // ----- FLIPBOX GAME CONTRACT v1 : END --------------------------------------
-//
-//  Render rules: the launcher clears the buffer and sets draw colour 1, solid
-//  font mode, bitmap mode 0 on entry. Set fonts/colours you need inside
-//  render() each frame -- do not assume they survive between frames (the debug
-//  FPS overlay may touch them). Never call sendBuffer()/clearBuffer() yourself.
 
-// ============================================================================
-//  LAUNCHER EXTRAS (optional; NOT part of contract v1, so games that do not use
-//  them are unaffected).  A game that wants them declares the same prototypes
-//  inside its own  namespace fb { ... }  block.
-//
-//     keyPressedAtUs(KEY_x)  micros() timestamp of the most recent accepted
-//                            press edge of ONE key (+-1 ms accurate).
-//     frameStartUs()         micros() timestamp this frame's input was sampled
-//                            at; the Frame::dtUs clock is based on it.
-//     displayLatencyUs()     estimated delay from frameStartUs() until what the
-//                            frame draws becomes visible on the panel.
-// ============================================================================
 namespace fb {
 uint32_t keyPressedAtUs(uint8_t keyMask);
 uint32_t frameStartUs();
 uint32_t displayLatencyUs();
 }
 
-// Weak references: a missing game .cpp resolves to nullptr instead of a link error.
+// Weak references
 #define FB_DECLARE_WEAK(id, label) extern const fb::Game fbGame_##id __attribute__((weak));
 FB_GAME_LIST(FB_DECLARE_WEAK)
 
 namespace {
 
 // ============================================================================
-//  4. HARDWARE  (existing wiring plus owner-configured X button on D4/GPIO4)
+//  4. HARDWARE
 // ============================================================================
 constexpr uint8_t PIN_SDA    = 21;
 constexpr uint8_t PIN_SCL    = 22;
@@ -214,62 +148,54 @@ constexpr uint8_t PIN_DOWN   = 33;
 constexpr uint8_t PIN_LEFT   = 25;
 constexpr uint8_t PIN_RIGHT  = 27;
 constexpr uint8_t PIN_SELECT = 32;
-constexpr uint8_t PIN_X      = 4;  // Board pin D4 (ESP32 GPIO4)
-// Buttons: INPUT_PULLUP, pressed = LOW.
+constexpr uint8_t PIN_X      = 4;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C gDisp(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
 
 // ============================================================================
 //  5. DISPLAY PRESENTATION
 // ============================================================================
-// Flush timing, shared between the game loop (core 1) and the flush task
-// (core 0).  All are single aligned 32-bit words, so plain volatile access is
-// atomic enough.
-volatile uint32_t gFlushDurUs   = 12000;   // smoothed duration of one OLED transfer
-volatile uint32_t gFlushStartUs = 0;       // micros() when the latest transfer began
-volatile bool     gFlushBusy    = false;   // a transfer is in flight
-uint32_t          gWorkUs       = 3000;    // smoothed update+render time of a frame
-uint32_t          gFrameNowUs   = 0;       // micros() the current frame was started at
+volatile uint32_t gFlushDurUs   = 12000;
+volatile uint32_t gFlushStartUs = 0;
+volatile bool     gFlushBusy    = false;
+uint32_t          gWorkUs       = 3000;
+uint32_t          gFrameNowUs   = 0;
 
 #if FB_ASYNC_DISPLAY
-uint8_t           gShadow[1024] __attribute__((aligned(4)));   // frame being sent
-SemaphoreHandle_t gFlushDone = nullptr;                        // given when OLED link is idle
+uint8_t           gShadow[1024] __attribute__((aligned(4)));
+SemaphoreHandle_t gFlushDone = nullptr;
 TaskHandle_t      gFlushTaskHandle = nullptr;
 
 #if FB_FAST_FLUSH
-uint16_t gFlushChunk = 32;      // data bytes per I2C write (set in setup())
-bool     gNeedWindow = true;    // (re)send the column/page window before the next frame
+uint16_t gFlushChunk = 32;
+bool     gNeedWindow = true;
 
-// Streams gShadow to the SSD1306 in a few long writes.  The controller is put
-// in horizontal addressing mode with the window covering the whole screen, so
-// 1024 data bytes fill it and the address pointer wraps back to the origin by
-// itself; the window is only re-sent after a failed transfer.
 bool fastFlush() {
-  uint8_t a8 = gDisp.getU8x8()->i2c_address;       // 8-bit form, 0x78 for 0x3C
+  uint8_t a8 = gDisp.getU8x8()->i2c_address;
   if (a8 == 255) a8 = 0x78;
   const uint8_t addr = (uint8_t)(a8 >> 1);
 
   if (gNeedWindow) {
     Wire.beginTransmission(addr);
-    Wire.write((uint8_t)0x00);                      // control byte: command stream
-    Wire.write((uint8_t)0x20); Wire.write((uint8_t)0x00);                     // horizontal addressing
-    Wire.write((uint8_t)0x21); Wire.write((uint8_t)0x00); Wire.write((uint8_t)127);  // columns 0..127
-    Wire.write((uint8_t)0x22); Wire.write((uint8_t)0x00); Wire.write((uint8_t)7);    // pages   0..7
+    Wire.write((uint8_t)0x00);
+    Wire.write((uint8_t)0x20); Wire.write((uint8_t)0x00);
+    Wire.write((uint8_t)0x21); Wire.write((uint8_t)0x00); Wire.write((uint8_t)127);
+    Wire.write((uint8_t)0x22); Wire.write((uint8_t)0x00); Wire.write((uint8_t)7);
     if (Wire.endTransmission() != 0) return false;
     gNeedWindow = false;
   }
   for (uint16_t off = 0; off < sizeof(gShadow); off = (uint16_t)(off + gFlushChunk)) {
     Wire.beginTransmission(addr);
-    Wire.write((uint8_t)0x40);                      // control byte: data stream
+    Wire.write((uint8_t)0x40);
     Wire.write(gShadow + off, (size_t)gFlushChunk);
     if (Wire.endTransmission() != 0) {
-      gNeedWindow = true;                           // pointer position unknown now
+      gNeedWindow = true;
       return false;
     }
   }
   return true;
 }
-#endif  // FB_FAST_FLUSH
+#endif
 
 void flushTask(void*) {
 #if !FB_FAST_FLUSH
@@ -285,17 +211,14 @@ void flushTask(void*) {
     }
 #endif
     uint32_t d = micros() - gFlushStartUs;
-    if (d > 60000UL) d = 60000UL;                   // ignore stalls / error timeouts
+    if (d > 60000UL) d = 60000UL;
     gFlushDurUs = (uint32_t)((gFlushDurUs * 3UL + d) >> 2);
     gFlushBusy  = false;
     xSemaphoreGive(gFlushDone);
   }
 }
-#endif  // FB_ASYNC_DISPLAY
+#endif
 
-// Hands the finished frame to the OLED. With async display this returns as soon
-// as the 1 KB snapshot is taken; it only waits if the previous frame is still
-// travelling over I2C (that wait is the natural, hardware-limited frame pacing).
 inline void presentFrame() {
 #if FB_ASYNC_DISPLAY
   xSemaphoreTake(gFlushDone, portMAX_DELAY);
@@ -312,31 +235,21 @@ inline void presentFrame() {
 #endif
 }
 
-// Late latch: block until the transfer in flight is about to finish, minus the
-// time update()+render() are expected to take.  The next frame is then ready
-// exactly when the link frees up (no throughput loss), but its input was
-// sampled as late as possible, so it is roughly one transfer "fresher" than
-// sampling right after the previous frame was handed over.
 inline void waitForLatch() {
 #if FB_ASYNC_DISPLAY && FB_LATE_LATCH
   const uint32_t workEst = gWorkUs + (gWorkUs >> 2) + FB_LATCH_MARGIN_US;
   for (;;) {
     if (!gFlushBusy) return;
     const int32_t remain = (int32_t)(gFlushStartUs + gFlushDurUs - workEst - micros());
-    if (remain <= 0 || remain > 100000) return;     // due, or timing data is bogus
-    if (remain > 1500 && portTICK_PERIOD_MS == 1) vTaskDelay(1);   // sleep coarse, spin the rest
+    if (remain <= 0 || remain > 100000) return;
+    if (remain > 1500 && portTICK_PERIOD_MS == 1) vTaskDelay(1);
   }
 #endif
 }
 
 // ============================================================================
-//  6. INPUT  (6 buttons, direct register read, zero-latency debounce + gating)
+//  6. INPUT
 // ============================================================================
-// The raw pins are sampled (a) by pollInput() once per frame and (b) by a 1 kHz
-// esp_timer callback.  Both run the same debouncer under one spinlock, and every
-// accepted edge is LATCHED (pressed / released bits + press time-stamp).  A
-// frame therefore sees every edge since the previous frame, even a tap that was
-// pressed and released entirely between two frames.
 constexpr uint8_t kKeyCount = 6;
 
 constexpr bool pinHigh(uint32_t lo, uint32_t hi, uint8_t pin) {
@@ -344,8 +257,8 @@ constexpr bool pinHigh(uint32_t lo, uint32_t hi, uint8_t pin) {
 }
 
 inline uint8_t readRaw() {
-  const uint32_t lo = REG_READ(GPIO_IN_REG);    // GPIO 0..31
-  const uint32_t hi = REG_READ(GPIO_IN1_REG);   // GPIO 32..39
+  const uint32_t lo = REG_READ(GPIO_IN_REG);
+  const uint32_t hi = REG_READ(GPIO_IN1_REG);
   return (uint8_t)((pinHigh(lo, hi, PIN_UP)     ? 0 : fb::KEY_UP)    |
                    (pinHigh(lo, hi, PIN_DOWN)   ? 0 : fb::KEY_DOWN)  |
                    (pinHigh(lo, hi, PIN_LEFT)   ? 0 : fb::KEY_LEFT)  |
@@ -356,21 +269,16 @@ inline uint8_t readRaw() {
 
 fb::Input gIn = {0, 0, 0};
 
-// ---- shared with the 1 kHz sampler (protected by gInMux) -------------------
 portMUX_TYPE      gInMux = portMUX_INITIALIZER_UNLOCKED;
-uint8_t           gSt      = 0;                 // debounced state
-uint8_t           gPressL  = 0;                 // press   edges since the last pollInput()
-uint8_t           gRelL    = 0;                 // release edges since the last pollInput()
+uint8_t           gSt      = 0;
+uint8_t           gPressL  = 0;
+uint8_t           gRelL    = 0;
 uint32_t          gChangeUs[kKeyCount] = {0, 0, 0, 0, 0, 0};
-volatile uint32_t gPressUs[kKeyCount]  = {0, 0, 0, 0, 0, 0};   // time of latest press edge
+volatile uint32_t gPressUs[kKeyCount]  = {0, 0, 0, 0, 0, 0};
 
-// ---- game-loop side only ----------------------------------------------------
-uint8_t           gBlocked = 0;                 // keys ignored until physically released
-uint8_t           gPrevCur = 0;                 // debounced state seen by the previous poll
+uint8_t           gBlocked = 0;
+uint8_t           gPrevCur = 0;
 
-// The first edge of a key is accepted immediately; further changes of that same
-// key are ignored for FB_DEBOUNCE_US, which swallows contact bounce.
-// Caller must hold gInMux.
 inline void sampleLocked(uint32_t nowUs) {
   const uint8_t diff = (uint8_t)(readRaw() ^ gSt);
   if (!diff) return;
@@ -401,7 +309,7 @@ void inputInit() {
   pinMode(PIN_X,      INPUT_PULLUP);
   gSt      = readRaw();
   gPrevCur = gSt;
-  gBlocked = gSt;                       // a key held at power-on does nothing
+  gBlocked = gSt;
 
   esp_timer_create_args_t args = {};
   args.callback = inputTimerCb;
@@ -410,12 +318,9 @@ void inputInit() {
   if (esp_timer_create(&args, &h) == ESP_OK) esp_timer_start_periodic(h, 1000);
 }
 
-// Blocks the given keys until they are released (input gating).
 inline void gateInput(uint8_t mask)  { gBlocked |= mask; }
 inline void gateHeldInputs()         { gBlocked |= gPrevCur; }
 
-// Called once per frame: takes a fresh sample, then hands the game everything
-// that happened since the previous call.
 inline void pollInput(uint32_t nowUs) {
   uint8_t cur, pL, rL;
   portENTER_CRITICAL(&gInMux);
@@ -428,7 +333,7 @@ inline void pollInput(uint32_t nowUs) {
   portEXIT_CRITICAL(&gInMux);
 
   const uint8_t wasBlocked = gBlocked;
-  gBlocked &= (uint8_t)(cur & ~rL);                         // released (even briefly) -> unblocked
+  gBlocked &= (uint8_t)(cur & ~rL);
   gIn.held     = (uint8_t)(cur & ~gBlocked);
   gIn.pressed  = (uint8_t)(pL  & ~gBlocked);
   gIn.released = (uint8_t)(rL  & ~wasBlocked);
@@ -436,30 +341,117 @@ inline void pollInput(uint32_t nowUs) {
 }
 
 // ============================================================================
-//  7. GAME TABLE
+//  7. SETTINGS  (NVS / Preferences)
+// ============================================================================
+Preferences gPrefs;
+
+struct Settings {
+  uint8_t brightness;      // 1 … 100
+  bool    passwordOn;
+  bool    airplane;
+  bool    troll;
+};
+
+Settings gCfg = { 80, false, false, false };
+
+void applyBrightness() {
+  // Map 1-100 → 8-255 so the panel never goes fully black
+  uint8_t c = (uint8_t)(8 + ((uint16_t)(gCfg.brightness - 1) * 247) / 99);
+  gDisp.setContrast(c);
+}
+
+void loadSettings() {
+  gPrefs.begin("flipbox", true);
+  gCfg.brightness  = gPrefs.getUChar("bri", 80);
+  if (gCfg.brightness < 1)  gCfg.brightness = 1;
+  if (gCfg.brightness > 100) gCfg.brightness = 100;
+  gCfg.passwordOn  = gPrefs.getBool("pwd", false);
+  gCfg.airplane    = gPrefs.getBool("air", false);
+  gCfg.troll       = gPrefs.getBool("trl", false);
+  gPrefs.end();
+}
+
+void saveSettings() {
+  gPrefs.begin("flipbox", false);
+  gPrefs.putUChar("bri", gCfg.brightness);
+  gPrefs.putBool ("pwd", gCfg.passwordOn);
+  gPrefs.putBool ("air", gCfg.airplane);
+  gPrefs.putBool ("trl", gCfg.troll);
+  gPrefs.end();
+}
+
+// ============================================================================
+//  8. UI STATE MACHINE
+// ============================================================================
+enum UiMode : uint8_t {
+  UI_PASSWORD = 0,   // boot gate
+  UI_MENU,
+  UI_SETTINGS,
+  UI_BRIGHTNESS,
+  UI_GAME
+};
+
+UiMode   gMode          = UI_MENU;
+uint8_t  gSel           = 0;
+uint8_t  gTop           = 0;
+bool     gMenuDirty     = true;
+uint32_t gMsgUntil      = 0;
+
+const fb::Game* gActive = nullptr;
+
+// Hold tracking for long-press actions
+uint32_t gHoldStartMs   = 0;     // when the relevant button first went down
+uint8_t  gHoldKey       = 0;     // which key we are currently tracking
+bool     gHoldArmed     = false; // true while a qualifying hold is in progress
+
+// Settings grid
+constexpr uint8_t kOptCount = 6;
+uint8_t  gOptSel        = 0;     // 0-5
+bool     gSettingsDirty = true;
+
+// Open / close animation for the settings panel (0 = closed, 255 = fully open)
+uint8_t  gSetAnim       = 0;
+bool     gSetAnimIn     = true;  // true = opening, false = closing
+
+// Brightness editor
+uint8_t  gBriTemp       = 80;
+
+// Password sequence: UP DOWN UP DOWN
+constexpr uint8_t kPwdLen = 4;
+const uint8_t kPwdSeq[kPwdLen] = {
+  fb::KEY_UP, fb::KEY_DOWN, fb::KEY_UP, fb::KEY_DOWN
+};
+uint8_t  gPwdIdx        = 0;
+bool     gPwdWrong      = false;
+uint32_t gPwdWrongUntil = 0;
+
+// Troll-mode disable hold
+uint32_t gTrollHoldStart = 0;
+bool     gTrollHoldArmed = false;
+
+// Simple PRNG for troll visuals (xorshift)
+uint32_t gRng = 0xA5A5C3C3u;
+inline uint32_t rnd() {
+  gRng ^= gRng << 13;
+  gRng ^= gRng >> 17;
+  gRng ^= gRng << 5;
+  return gRng;
+}
+
+// ============================================================================
+//  9. GAME TABLE
 // ============================================================================
 struct Entry {
   const char*     label;
-  const fb::Game* game;        // nullptr when the game's .cpp is not in src/
+  const fb::Game* game;
 };
 
 #define FB_TABLE_ROW(id, label) { label, &fbGame_##id },
 const Entry kGames[] = { FB_GAME_LIST(FB_TABLE_ROW) };
-
 constexpr uint8_t kGameCount = (uint8_t)(sizeof(kGames) / sizeof(kGames[0]));
 static_assert(kGameCount >= 1, "FB_GAME_LIST needs at least one entry");
 
-// ============================================================================
-//  8. LAUNCHER / MENU STATE
-// ============================================================================
 constexpr uint8_t kVisibleRows = 3;
-
-uint8_t  gSel       = 0;            // highlighted entry (kept when returning from a game)
-uint8_t  gTop       = 0;            // first visible entry
-bool     gMenuDirty = true;
-uint32_t gMsgUntil  = 0;            // "NOT INSTALLED" popup deadline (ms), 0 = hidden
-
-const fb::Game* gActive = nullptr;  // nullptr = menu
 
 // Game timing
 uint32_t gLastUs    = 0;
@@ -471,12 +463,103 @@ fb::Frame gFrame    = {0, 0, 0, 0};
 
 inline char digitChar(uint8_t n) { return (n < 10) ? (char)('0' + n) : '+'; }
 
+// ============================================================================
+// 10. DRAWING HELPERS (premium monochrome UI)
+// ============================================================================
+void drawRoundedBox(int x, int y, int w, int h, int r) {
+  // Soft rounded rectangle (filled)
+  gDisp.drawBox(x + r, y, w - 2 * r, h);
+  gDisp.drawBox(x, y + r, w, h - 2 * r);
+  gDisp.drawDisc(x + r, y + r, r);
+  gDisp.drawDisc(x + w - r - 1, y + r, r);
+  gDisp.drawDisc(x + r, y + h - r - 1, r);
+  gDisp.drawDisc(x + w - r - 1, y + h - r - 1, r);
+}
+
+void drawRoundedFrame(int x, int y, int w, int h, int r) {
+  gDisp.drawHLine(x + r, y, w - 2 * r);
+  gDisp.drawHLine(x + r, y + h - 1, w - 2 * r);
+  gDisp.drawVLine(x, y + r, h - 2 * r);
+  gDisp.drawVLine(x + w - 1, y + r, h - 2 * r);
+  // corner arcs approximated with pixels
+  gDisp.drawPixel(x + 1, y + 1);
+  gDisp.drawPixel(x + w - 2, y + 1);
+  gDisp.drawPixel(x + 1, y + h - 2);
+  gDisp.drawPixel(x + w - 2, y + h - 2);
+  gDisp.drawPixel(x + 2, y);
+  gDisp.drawPixel(x + w - 3, y);
+  gDisp.drawPixel(x + 2, y + h - 1);
+  gDisp.drawPixel(x + w - 3, y + h - 1);
+  gDisp.drawPixel(x, y + 2);
+  gDisp.drawPixel(x + w - 1, y + 2);
+  gDisp.drawPixel(x, y + h - 3);
+  gDisp.drawPixel(x + w - 1, y + h - 3);
+}
+
+// Progress bar for long-press feedback
+void drawHoldBar(uint8_t progress /*0-100*/, int y = 60) {
+  const int barW = 100;
+  const int barX = (128 - barW) / 2;
+  gDisp.setDrawColor(1);
+  gDisp.drawFrame(barX, y, barW, 4);
+  int fill = (barW - 2) * progress / 100;
+  if (fill > 0) gDisp.drawBox(barX + 1, y + 1, fill, 2);
+}
+
+// ============================================================================
+// 11. TROLL MODE OVERLAY  (“virus” visual noise)
+// ============================================================================
+void applyTrollOverlay() {
+  if (!gCfg.troll) return;
+
+  // Random horizontal / vertical cracks
+  for (int i = 0; i < 6; ++i) {
+    int x0 = (int)(rnd() % 128);
+    int y0 = (int)(rnd() % 64);
+    int len = 8 + (int)(rnd() % 24);
+    if (rnd() & 1) {
+      gDisp.drawHLine(x0, y0, len);
+    } else {
+      gDisp.drawVLine(x0, y0, len);
+    }
+  }
+
+  // Scattered blobs / “flakes”
+  for (int i = 0; i < 12; ++i) {
+    int x = (int)(rnd() % 128);
+    int y = (int)(rnd() % 64);
+    int r = 1 + (int)(rnd() % 3);
+    if (rnd() & 1) gDisp.drawDisc(x, y, r);
+    else           gDisp.drawCircle(x, y, r);
+  }
+
+  // Occasional full-width glitch lines
+  if ((rnd() & 0x1F) < 4) {
+    int y = (int)(rnd() % 64);
+    gDisp.drawHLine(0, y, 128);
+    if (y + 1 < 64) gDisp.drawHLine(0, y + 1, 128);
+  }
+
+  // Soft “blur” by random pixel inversion in a few bands
+  for (int b = 0; b < 3; ++b) {
+    int y = (int)(rnd() % 56);
+    for (int x = 0; x < 128; x += 2 + (int)(rnd() % 3)) {
+      // invert a single pixel (read-modify via draw)
+      // U8g2 has no getPixel, so we just sprinkle extra noise
+      gDisp.drawPixel(x, y + (int)(rnd() % 8));
+    }
+  }
+}
+
+// ============================================================================
+// 12. MENU DRAWING
+// ============================================================================
 void drawMenu() {
   gDisp.clearBuffer();
   gDisp.setFontMode(1);
   gDisp.setDrawColor(1);
 
-  // Header: title, "n/m" counter, rule.
+  // Header
   gDisp.setFont(u8g2_font_7x13B_tr);
   gDisp.drawStr(2, 11, "flipBOX");
   gDisp.setFont(u8g2_font_5x7_tr);
@@ -485,7 +568,12 @@ void drawMenu() {
   gDisp.drawGlyph(121, 11, digitChar(kGameCount));
   gDisp.drawHLine(0, 14, 128);
 
-  // List: rows 15 px apart starting at y=17, selected row is an inverted bar.
+  // Airplane indicator (tiny plane icon when active)
+  if (gCfg.airplane) {
+    gDisp.setFont(u8g2_font_5x7_tr);
+    gDisp.drawStr(78, 11, "AIR");
+  }
+
   const bool    scroll = kGameCount > kVisibleRows;
   const uint8_t listW  = scroll ? 124 : 128;
   for (uint8_t r = 0; r < kVisibleRows; ++r) {
@@ -506,7 +594,6 @@ void drawMenu() {
     gDisp.setDrawColor(1);
   }
 
-  // Scroll bar (only when the list does not fit).
   if (scroll) {
     constexpr uint8_t trackY = 17, trackH = 44;
     uint8_t thumbH = (uint8_t)((trackH * kVisibleRows) / kGameCount);
@@ -517,7 +604,6 @@ void drawMenu() {
     gDisp.drawBox(125, thumbY, 3, thumbH);
   }
 
-  // Popup for a registered game whose .cpp has not been added yet.
   if (gMsgUntil) {
     gDisp.setDrawColor(0);
     gDisp.drawBox(14, 20, 100, 24);
@@ -526,6 +612,23 @@ void drawMenu() {
     gDisp.drawFrame(15, 21, 98, 22);
     gDisp.setFont(u8g2_font_6x13B_tr);
     gDisp.drawStr(25, 37, "NOT INSTALLED");
+  }
+
+  // Hold-UP progress bar (entering settings) – only after 500 ms
+  if (gHoldArmed && gHoldKey == fb::KEY_UP && gMode == UI_MENU) {
+    uint32_t held = millis() - gHoldStartMs;
+    if (held >= 500) {
+      if (held > 1000) held = 1000;
+      // map 500→1000 ms into 0→100 %
+      drawHoldBar((uint8_t)((held - 500) * 100 / 500));
+    }
+  }
+
+  // Troll-kill progress bar
+  if (gTrollHoldArmed && gCfg.troll) {
+    uint32_t held = millis() - gTrollHoldStart;
+    if (held > 4000) held = 4000;
+    drawHoldBar((uint8_t)(held / 40), 54);
   }
 }
 
@@ -538,11 +641,247 @@ void menuMove(int8_t dir) {
   gMenuDirty = true;
 }
 
+// ============================================================================
+// 13. SETTINGS SCREEN  (pure GUI 2×3 icon grid – no text)
+// ============================================================================
+const bool kOptSelectable[kOptCount] = {
+  true, true, true, true, false, false
+};
+
+// Evenly spaced centres for 128×64 with no labels
+void optCentre(uint8_t idx, int& cx, int& cy) {
+  const int col = idx % 3;
+  const int row = idx / 3;
+  cx = 24 + col * 40;   // 24, 64, 104
+  cy = 18 + row * 28;   // 18, 46
+}
+
+// Classic trollface simplified for ~14 px icon
+void drawTrollFace(int cx, int cy) {
+  // Head outline
+  gDisp.drawCircle(cx, cy, 7);
+  // Jaw bulge
+  gDisp.drawPixel(cx - 6, cy + 4);
+  gDisp.drawPixel(cx + 6, cy + 4);
+  gDisp.drawPixel(cx - 5, cy + 5);
+  gDisp.drawPixel(cx + 5, cy + 5);
+
+  // Eyes (narrow slits)
+  gDisp.drawHLine(cx - 5, cy - 2, 3);
+  gDisp.drawHLine(cx + 2, cy - 2, 3);
+  gDisp.drawPixel(cx - 4, cy - 3);
+  gDisp.drawPixel(cx + 3, cy - 3);
+
+  // Nose / cheeks
+  gDisp.drawPixel(cx - 1, cy);
+  gDisp.drawPixel(cx + 1, cy);
+
+  // Huge grin
+  gDisp.drawHLine(cx - 5, cy + 2, 11);
+  // teeth
+  gDisp.drawPixel(cx - 4, cy + 3);
+  gDisp.drawPixel(cx - 2, cy + 3);
+  gDisp.drawPixel(cx,     cy + 3);
+  gDisp.drawPixel(cx + 2, cy + 3);
+  gDisp.drawPixel(cx + 4, cy + 3);
+  // lower lip
+  gDisp.drawHLine(cx - 4, cy + 4, 9);
+  // mouth corners
+  gDisp.drawPixel(cx - 6, cy + 1);
+  gDisp.drawPixel(cx + 6, cy + 1);
+  gDisp.drawPixel(cx - 5, cy + 1);
+  gDisp.drawPixel(cx + 5, cy + 1);
+}
+
+void drawOptIcon(uint8_t idx, bool selected, int animOffsetY) {
+  int cx, cy;
+  optCentre(idx, cx, cy);
+  cy += animOffsetY;
+
+  const bool blank = !kOptSelectable[idx];
+  const int  r     = 13;
+
+  // Selection ring
+  gDisp.setDrawColor(1);
+  if (selected) {
+    // solid outer disc + hollow centre = strong focus
+    gDisp.drawDisc(cx, cy, r);
+    gDisp.setDrawColor(0);
+    gDisp.drawDisc(cx, cy, r - 3);
+    gDisp.setDrawColor(1);
+  } else if (!blank) {
+    gDisp.drawCircle(cx, cy, r);
+    gDisp.drawCircle(cx, cy, r - 1);
+  } else {
+    gDisp.drawCircle(cx, cy, r - 1);
+  }
+
+  // Glyph
+  if (blank) {
+    gDisp.drawHLine(cx - 3, cy, 6);
+  } else {
+    switch (idx) {
+      case 0: { // brightness – sun
+        gDisp.drawDisc(cx, cy, 3);
+        gDisp.drawVLine(cx,     cy - 9, 3);
+        gDisp.drawVLine(cx,     cy + 6, 3);
+        gDisp.drawHLine(cx - 9, cy,     3);
+        gDisp.drawHLine(cx + 6, cy,     3);
+        gDisp.drawPixel(cx - 6, cy - 6); gDisp.drawPixel(cx - 7, cy - 7);
+        gDisp.drawPixel(cx + 6, cy - 6); gDisp.drawPixel(cx + 7, cy - 7);
+        gDisp.drawPixel(cx - 6, cy + 6); gDisp.drawPixel(cx - 7, cy + 7);
+        gDisp.drawPixel(cx + 6, cy + 6); gDisp.drawPixel(cx + 7, cy + 7);
+        break;
+      }
+      case 1: { // password – lock
+        gDisp.drawFrame(cx - 5, cy - 1, 10, 7);
+        gDisp.drawBox(cx - 2, cy + 1, 4, 3);
+        gDisp.drawCircle(cx, cy - 4, 3);
+        gDisp.setDrawColor(0);
+        gDisp.drawDisc(cx, cy - 4, 1);
+        gDisp.setDrawColor(1);
+        break;
+      }
+      case 2: { // airplane
+        gDisp.drawHLine(cx - 7, cy, 14);
+        gDisp.drawHLine(cx - 7, cy + 1, 14);
+        gDisp.drawLine(cx - 1, cy, cx - 5, cy - 5);
+        gDisp.drawLine(cx,     cy, cx - 4, cy - 5);
+        gDisp.drawLine(cx - 1, cy, cx - 5, cy + 5);
+        gDisp.drawLine(cx,     cy, cx - 4, cy + 5);
+        gDisp.drawLine(cx + 5, cy, cx + 7, cy - 3);
+        gDisp.drawLine(cx + 5, cy, cx + 7, cy + 3);
+        break;
+      }
+      case 3: { // trollface
+        drawTrollFace(cx, cy);
+        break;
+      }
+    }
+  }
+
+  // ON indicator – filled dot at top-right of the circle
+  bool isOn = false;
+  if (idx == 1) isOn = gCfg.passwordOn;
+  if (idx == 2) isOn = gCfg.airplane;
+  if (idx == 3) isOn = gCfg.troll;
+  if (isOn) {
+    gDisp.setDrawColor(1);
+    gDisp.drawDisc(cx + r - 2, cy - r + 2, 3);
+    if (selected) {
+      gDisp.setDrawColor(0);
+      gDisp.drawDisc(cx + r - 2, cy - r + 2, 1);
+      gDisp.setDrawColor(1);
+    }
+  }
+}
+
+void drawSettings() {
+  gDisp.clearBuffer();
+  gDisp.setFontMode(1);
+  gDisp.setDrawColor(1);
+
+  // Slide-in animation
+  int offsetY = 0;
+  if (gSetAnim < 255) {
+    offsetY = (int)((255 - gSetAnim) * 36 / 255);
+  }
+
+  // Pure icon grid – no header, no footer text
+  for (uint8_t i = 0; i < kOptCount; ++i) {
+    drawOptIcon(i, i == gOptSel, offsetY);
+  }
+
+  // Hold-DOWN progress while leaving – only after 500 ms
+  if (gHoldArmed && gHoldKey == fb::KEY_DOWN && gMode == UI_SETTINGS) {
+    uint32_t held = millis() - gHoldStartMs;
+    if (held >= 500) {
+      if (held > 1000) held = 1000;
+      // map 500→1000 ms into 0→100 %
+      drawHoldBar((uint8_t)((held - 500) * 100 / 500), 60);
+    }
+  }
+
+  // Troll-kill progress
+  if (gTrollHoldArmed && gCfg.troll) {
+    uint32_t held = millis() - gTrollHoldStart;
+    if (held > 4000) held = 4000;
+    drawHoldBar((uint8_t)(held / 40), 60);
+  }
+}
+
+// ============================================================================
+// 14. BRIGHTNESS EDITOR
+// ============================================================================
+void drawBrightness() {
+  gDisp.clearBuffer();
+  gDisp.setFontMode(1);
+  gDisp.setDrawColor(1);
+
+  gDisp.setFont(u8g2_font_7x13B_tr);
+  gDisp.drawStr(28, 12, "BRIGHTNESS");
+  gDisp.drawHLine(0, 15, 128);
+
+  // Big percentage
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%u%%", (unsigned)gBriTemp);
+  gDisp.setFont(u8g2_font_logisoso16_tr);
+  int tw = gDisp.getStrWidth(buf);
+  gDisp.drawStr((128 - tw) / 2, 40, buf);
+
+  // Slider track
+  const int trackX = 14, trackW = 100, trackY = 48;
+  gDisp.drawFrame(trackX, trackY, trackW, 8);
+  int fill = (trackW - 2) * gBriTemp / 100;
+  if (fill > 0) gDisp.drawBox(trackX + 1, trackY + 1, fill, 6);
+
+  // Tick marks at 25/50/75
+  for (int p = 25; p <= 75; p += 25) {
+    int x = trackX + (trackW * p / 100);
+    gDisp.drawVLine(x, trackY - 2, 2);
+  }
+
+  gDisp.setFont(u8g2_font_4x6_tr);
+  gDisp.drawStr(2, 63, "UP/DN adjust  SEL save  X cancel");
+}
+
+// ============================================================================
+// 15. PASSWORD GATE
+// ============================================================================
+void drawPassword() {
+  gDisp.clearBuffer();
+  gDisp.setFontMode(1);
+  gDisp.setDrawColor(1);
+
+  gDisp.setFont(u8g2_font_7x13B_tr);
+  gDisp.drawStr(22, 14, "ENTER CODE");
+  gDisp.drawHLine(0, 17, 128);
+
+  // Four dots / filled when entered
+  for (uint8_t i = 0; i < kPwdLen; ++i) {
+    int x = 28 + i * 20;
+    if (i < gPwdIdx) gDisp.drawDisc(x, 34, 5);
+    else             gDisp.drawCircle(x, 34, 5);
+  }
+
+  if (gPwdWrong) {
+    gDisp.setFont(u8g2_font_6x13B_tr);
+    gDisp.drawStr(34, 54, "WRONG");
+  } else {
+    gDisp.setFont(u8g2_font_5x7_tr);
+    gDisp.drawStr(18, 54, "UP  DN  UP  DN");
+  }
+}
+
+// ============================================================================
+// 16. GAME ENTER / LEAVE
+// ============================================================================
 void enterGame(const fb::Game* g) {
   gActive = g;
-  gateHeldInputs();                     // SELECT (etc.) stays dead for the game until released
+  gMode   = UI_GAME;
+  gateHeldInputs();
 
-  gDisp.setDrawColor(1);                // predictable draw state for the game
+  gDisp.setDrawColor(1);
   gDisp.setFontMode(0);
   gDisp.setBitmapMode(0);
   gDisp.setFontDirection(0);
@@ -557,19 +896,107 @@ void enterGame(const fb::Game* g) {
 }
 
 void leaveGame() {
-  if (gActive->shutdown) gActive->shutdown();
+  if (gActive && gActive->shutdown) gActive->shutdown();
   gActive = nullptr;
-  gateHeldInputs();                     // the key that exited must not act in the menu
+  gMode   = UI_MENU;
+  gateHeldInputs();
   gMsgUntil  = 0;
   gMenuDirty = true;
 }
 
+// ============================================================================
+// 17. MODE RUNNERS
+// ============================================================================
+void runPassword() {
+  if (gPwdWrong && (int32_t)(millis() - gPwdWrongUntil) >= 0) {
+    gPwdWrong = false;
+    gPwdIdx   = 0;
+  }
+
+  const uint8_t p = gIn.pressed;
+  if (p && !gPwdWrong) {
+    uint8_t expected = kPwdSeq[gPwdIdx];
+    if (p & expected) {
+      gPwdIdx++;
+      if (gPwdIdx >= kPwdLen) {
+        gMode = UI_MENU;
+        gMenuDirty = true;
+        gateHeldInputs();
+      }
+    } else if (p & (fb::KEY_UP | fb::KEY_DOWN | fb::KEY_LEFT | fb::KEY_RIGHT | fb::KEY_SELECT | fb::KEY_X)) {
+      gPwdWrong = true;
+      gPwdWrongUntil = millis() + 800;
+      gPwdIdx = 0;
+    }
+    gateInput(p);
+  }
+
+  drawPassword();
+  applyTrollOverlay();
+  presentFrame();
+}
+
 void runMenu() {
+  // Global troll-kill (hold SELECT 4 s) even while on the menu
+  if (gCfg.troll) {
+    if (gIn.held & fb::KEY_SELECT) {
+      if (!gTrollHoldArmed) {
+        gTrollHoldArmed = true;
+        gTrollHoldStart = millis();
+        gMenuDirty = true;
+      } else {
+        uint32_t held = millis() - gTrollHoldStart;
+        if (held >= 4000) {
+          gCfg.troll = false;
+          saveSettings();
+          gTrollHoldArmed = false;
+          gateInput(fb::KEY_SELECT);
+          gMenuDirty = true;
+        } else {
+          gMenuDirty = true;
+        }
+      }
+    } else {
+      if (gTrollHoldArmed) { gTrollHoldArmed = false; gMenuDirty = true; }
+    }
+  }
+
+  // --- long-press UP to open settings (bar only after 500 ms) ---
+  if (gIn.held & fb::KEY_UP) {
+    if (!gHoldArmed || gHoldKey != fb::KEY_UP) {
+      gHoldArmed   = true;
+      gHoldKey     = fb::KEY_UP;
+      gHoldStartMs = millis();
+    } else {
+      uint32_t held = millis() - gHoldStartMs;
+      if (held >= 1000) {
+        // open settings
+        gHoldArmed     = false;
+        gMode          = UI_SETTINGS;
+        gOptSel        = 0;
+        gSetAnim       = 0;
+        gSetAnimIn     = true;
+        gSettingsDirty = true;
+        gateInput(fb::KEY_UP);
+        return;
+      }
+      // redraw only once the bar is visible (>= 500 ms)
+      if (held >= 500) gMenuDirty = true;
+    }
+  } else {
+    if (gHoldArmed && gHoldKey == fb::KEY_UP) {
+      gHoldArmed = false;
+      gMenuDirty = true;   // clear bar if it was showing
+    }
+  }
+
+  // Short-press navigation always works (not blocked by hold tracking)
   const uint8_t p = gIn.pressed;
   if (p) {
     if (p & (fb::KEY_UP | fb::KEY_LEFT)) {
       menuMove(-1);
-      gateInput(p & (fb::KEY_UP | fb::KEY_LEFT));
+      // do NOT gate UP here – allow the hold timer to keep running
+      if (p & fb::KEY_LEFT) gateInput(fb::KEY_LEFT);
     } else if (p & (fb::KEY_DOWN | fb::KEY_RIGHT)) {
       menuMove(+1);
       gateInput(p & (fb::KEY_DOWN | fb::KEY_RIGHT));
@@ -594,8 +1021,177 @@ void runMenu() {
   if (gMenuDirty) {
     gMenuDirty = false;
     drawMenu();
+    applyTrollOverlay();
     presentFrame();
   }
+}
+
+void runSettings() {
+  // Global troll-kill also works here
+  if (gCfg.troll) {
+    if (gIn.held & fb::KEY_SELECT) {
+      if (!gTrollHoldArmed) {
+        gTrollHoldArmed = true;
+        gTrollHoldStart = millis();
+        gSettingsDirty = true;
+      } else if (millis() - gTrollHoldStart >= 4000) {
+        gCfg.troll = false;
+        saveSettings();
+        gTrollHoldArmed = false;
+        gateInput(fb::KEY_SELECT);
+        gSettingsDirty = true;
+      } else {
+        gSettingsDirty = true;
+      }
+    } else if (gTrollHoldArmed) {
+      gTrollHoldArmed = false;
+      gSettingsDirty = true;
+    }
+  }
+
+  // Animation
+  if (gSetAnimIn && gSetAnim < 255) {
+    gSetAnim = (uint8_t)min(255, (int)gSetAnim + 18);
+    gSettingsDirty = true;
+  } else if (!gSetAnimIn && gSetAnim > 0) {
+    gSetAnim = (uint8_t)max(0, (int)gSetAnim - 22);
+    gSettingsDirty = true;
+    if (gSetAnim == 0) {
+      gMode = UI_MENU;
+      gMenuDirty = true;
+      gateHeldInputs();
+      return;
+    }
+  }
+
+  // Long-press DOWN to exit (bar only after 500 ms)
+  if (gIn.held & fb::KEY_DOWN) {
+    if (!gHoldArmed || gHoldKey != fb::KEY_DOWN) {
+      gHoldArmed   = true;
+      gHoldKey     = fb::KEY_DOWN;
+      gHoldStartMs = millis();
+    } else {
+      uint32_t held = millis() - gHoldStartMs;
+      if (held >= 1000) {
+        gHoldArmed = false;
+        gSetAnimIn = false;          // start close animation
+        gSettingsDirty = true;
+        gateInput(fb::KEY_DOWN);
+      } else if (held >= 500) {
+        gSettingsDirty = true;       // redraw bar once visible
+      }
+    }
+  } else {
+    if (gHoldArmed && gHoldKey == fb::KEY_DOWN) {
+      gHoldArmed = false;
+      gSettingsDirty = true;         // clear bar if it was showing
+    }
+  }
+
+  // Short-press navigation always works (not blocked by hold tracking)
+  const uint8_t p = gIn.pressed;
+  if (p && gSetAnimIn) {
+    if (p & fb::KEY_LEFT) {
+      if (gOptSel % 3 > 0) gOptSel--;
+      else gOptSel = (uint8_t)(gOptSel + 2);
+      gSettingsDirty = true;
+      gateInput(fb::KEY_LEFT);
+    } else if (p & fb::KEY_RIGHT) {
+      if (gOptSel % 3 < 2) gOptSel++;
+      else gOptSel = (uint8_t)(gOptSel - 2);
+      gSettingsDirty = true;
+      gateInput(fb::KEY_RIGHT);
+    } else if (p & fb::KEY_UP) {
+      if (gOptSel >= 3) gOptSel = (uint8_t)(gOptSel - 3);
+      else gOptSel = (uint8_t)(gOptSel + 3);
+      gSettingsDirty = true;
+      gateInput(fb::KEY_UP);
+    } else if (p & fb::KEY_DOWN) {
+      // short press moves; long press is tracked above
+      if (gOptSel < 3) gOptSel = (uint8_t)(gOptSel + 3);
+      else gOptSel = (uint8_t)(gOptSel - 3);
+      gSettingsDirty = true;
+      // do NOT gate DOWN – allow the hold timer to keep running
+    } else if (p & fb::KEY_SELECT) {
+      gateInput(fb::KEY_SELECT);
+      if (kOptSelectable[gOptSel]) {
+        switch (gOptSel) {
+          case 0: // brightness
+            gBriTemp = gCfg.brightness;
+            gMode = UI_BRIGHTNESS;
+            break;
+          case 1: // password toggle
+            gCfg.passwordOn = !gCfg.passwordOn;
+            saveSettings();
+            gSettingsDirty = true;
+            break;
+          case 2: // airplane
+            gCfg.airplane = !gCfg.airplane;
+            saveSettings();
+            gSettingsDirty = true;
+            break;
+          case 3: // troll
+            gCfg.troll = !gCfg.troll;
+            saveSettings();
+            gSettingsDirty = true;
+            break;
+        }
+      }
+    }
+  }
+
+  if (gSettingsDirty || gSetAnim < 255) {
+    gSettingsDirty = false;
+    drawSettings();
+    applyTrollOverlay();
+    presentFrame();
+  }
+}
+
+void runBrightness() {
+  const uint8_t p = gIn.pressed;
+  bool dirty = false;
+
+  if (p & fb::KEY_UP) {
+    if (gBriTemp < 100) { gBriTemp++; dirty = true; }
+    gateInput(fb::KEY_UP);
+  }
+  if (p & fb::KEY_DOWN) {
+    if (gBriTemp > 1) { gBriTemp--; dirty = true; }
+    gateInput(fb::KEY_DOWN);
+  }
+  // also support held for faster scrub
+  static uint32_t lastRepeat = 0;
+  if ((gIn.held & (fb::KEY_UP | fb::KEY_DOWN)) && (millis() - lastRepeat > 40)) {
+    lastRepeat = millis();
+    if ((gIn.held & fb::KEY_UP) && gBriTemp < 100) { gBriTemp++; dirty = true; }
+    if ((gIn.held & fb::KEY_DOWN) && gBriTemp > 1) { gBriTemp--; dirty = true; }
+  }
+
+  if (p & fb::KEY_SELECT) {
+    gCfg.brightness = gBriTemp;
+    applyBrightness();
+    saveSettings();
+    gMode = UI_SETTINGS;
+    gSettingsDirty = true;
+    gateInput(fb::KEY_SELECT);
+    return;
+  }
+  if (p & fb::KEY_X) {
+    gMode = UI_SETTINGS;
+    gSettingsDirty = true;
+    gateInput(fb::KEY_X);
+    return;
+  }
+
+  // live preview
+  uint8_t c = (uint8_t)(8 + ((uint16_t)(gBriTemp - 1) * 247) / 99);
+  gDisp.setContrast(c);
+
+  drawBrightness();
+  applyTrollOverlay();
+  presentFrame();
+  (void)dirty;
 }
 
 #if FB_SHOW_FPS
@@ -614,6 +1210,23 @@ void drawFpsOverlay() {
 #endif
 
 inline void runGame(uint32_t nowUs) {
+  // Troll-mode kill: hold SELECT 4 seconds
+  if (gCfg.troll) {
+    if (gIn.held & fb::KEY_SELECT) {
+      if (!gTrollHoldArmed) {
+        gTrollHoldArmed = true;
+        gTrollHoldStart = millis();
+      } else if (millis() - gTrollHoldStart >= 4000) {
+        gCfg.troll = false;
+        saveSettings();
+        gTrollHoldArmed = false;
+        gateInput(fb::KEY_SELECT);
+      }
+    } else {
+      gTrollHoldArmed = false;
+    }
+  }
+
   gFrameNowUs = nowUs;
   uint32_t dt = nowUs - gLastUs;
   gLastUs = nowUs;
@@ -634,8 +1247,16 @@ inline void runGame(uint32_t nowUs) {
 #if FB_SHOW_FPS
   drawFpsOverlay();
 #endif
+  applyTrollOverlay();
 
-  uint32_t work = micros() - nowUs;                 // input sample .. render done
+  // progress bar while killing troll
+  if (gTrollHoldArmed) {
+    uint32_t held = millis() - gTrollHoldStart;
+    if (held > 4000) held = 4000;
+    drawHoldBar((uint8_t)(held / 40), 58);
+  }
+
+  uint32_t work = micros() - nowUs;
   if (work > 50000UL) work = 50000UL;
   gWorkUs = (uint32_t)(gWorkUs - (gWorkUs >> 3) + (work >> 3));
   presentFrame();
@@ -652,7 +1273,7 @@ inline void runGame(uint32_t nowUs) {
 }  // namespace
 
 // ============================================================================
-//  LAUNCHER EXTRAS (see prototypes near the top of this file)
+//  LAUNCHER EXTRAS
 // ============================================================================
 namespace fb {
 
@@ -665,9 +1286,9 @@ uint32_t keyPressedAtUs(uint8_t keyMask) {
 uint32_t frameStartUs() { return gFrameNowUs; }
 
 uint32_t displayLatencyUs() {
-  uint32_t l = gWorkUs + (gWorkUs >> 2) + FB_LATCH_MARGIN_US   // sample -> frame handed over
-             + gFlushDurUs                                      // frame -> last byte on the panel
-             + FB_PANEL_LATENCY_US;                             // panel scan-out
+  uint32_t l = gWorkUs + (gWorkUs >> 2) + FB_LATCH_MARGIN_US
+             + gFlushDurUs
+             + FB_PANEL_LATENCY_US;
   if (l > 100000UL) l = 100000UL;
   return l;
 }
@@ -679,49 +1300,62 @@ uint32_t displayLatencyUs() {
 // ============================================================================
 void setup() {
   inputInit();
+  loadSettings();
 
 #if FB_ASYNC_DISPLAY && FB_FAST_FLUSH
-  // The Wire buffer must hold control byte + one chunk; it can only be resized
-  // before Wire.begin(), which gDisp.begin() performs.
   {
     uint16_t chunk = FB_I2C_CHUNK;
     if (chunk > 1024) chunk = 1024;
     size_t got = Wire.setBufferSize((size_t)chunk + 1);
-    if (got == 0) got = 128;                                    // library default
+    if (got == 0) got = 128;
     while (chunk > 16 && (size_t)chunk + 1 > got) chunk = (uint16_t)(chunk >> 1);
     gFlushChunk = chunk;
   }
 #endif
 
   gDisp.begin();
-  gDisp.setBusClock(FB_I2C_HZ);         // after begin(): applied to every transfer
-  Wire.setClock(FB_I2C_HZ);             // also for the raw Wire writes of the fast flush
+  gDisp.setBusClock(FB_I2C_HZ);
+  Wire.setClock(FB_I2C_HZ);
 
 #if FB_OLED_OSC
   {
     u8x8_t* const u8x8 = gDisp.getU8x8();
     u8x8_cad_StartTransfer(u8x8);
-    u8x8_cad_SendCmd(u8x8, 0x0D5);      // set display clock divide ratio / oscillator frequency
+    u8x8_cad_SendCmd(u8x8, 0x0D5);
     u8x8_cad_SendArg(u8x8, (uint8_t)FB_OLED_OSC);
     u8x8_cad_EndTransfer(u8x8);
   }
 #endif
 
+  applyBrightness();
   gDisp.clearBuffer();
 
 #if FB_ASYNC_DISPLAY
   gFlushDone = xSemaphoreCreateBinary();
-  xSemaphoreGive(gFlushDone);           // link starts idle
+  xSemaphoreGive(gFlushDone);
   xTaskCreatePinnedToCore(flushTask, "fbOLED", 4096, nullptr, 2, &gFlushTaskHandle, 0);
 #endif
 
-  gMenuDirty = true;                    // boots straight into the menu
+  // Boot into password gate or main menu
+  if (gCfg.passwordOn) {
+    gMode = UI_PASSWORD;
+    gPwdIdx = 0;
+  } else {
+    gMode = UI_MENU;
+    gMenuDirty = true;
+  }
 }
 
 void loop() {
-  if (gActive) waitForLatch();          // game frames start just-in-time (no-op in the menu)
+  if (gMode == UI_GAME) waitForLatch();
   const uint32_t now = micros();
   pollInput(now);
-  if (gActive) runGame(now);
-  else         runMenu();
+
+  switch (gMode) {
+    case UI_PASSWORD:   runPassword();   break;
+    case UI_MENU:       runMenu();       break;
+    case UI_SETTINGS:   runSettings();   break;
+    case UI_BRIGHTNESS: runBrightness(); break;
+    case UI_GAME:       runGame(now);    break;
+  }
 }
