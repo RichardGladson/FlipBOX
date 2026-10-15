@@ -76,7 +76,8 @@
   X(FastAndFurious, "Fast and Furious")                    \
   X(TokyoDrift,     "Tokyo Drift")                         \
   X(TwoFast2Furious, "2 Fast 2 Furious") \
-  X(HillClimb, "Hill Climb Racing")
+  X(HillClimb, "Hill Climb Racing") \
+  X(MiamiRun, "Miami Run")
 
 // ============================================================================
 //  3. FLIPBOX GAME CONTRACT v1
