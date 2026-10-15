@@ -12,7 +12,10 @@
 // sharper corner) and dotted lines mark drift-initiation zones before suitable
 // corners. Both, and the HUD next-corner chevrons, are derived once per track
 // from the curvature table (analyseCorners), nothing is hard-coded per corner.
-// Road width depends on the track (wide = easy, narrow = expert).
+// Bordered, striped kerbs run on the edge the bend turns toward: a long thin lead-in well before the
+// corner, a build-up, a bulge at the apex, then a fade-out; thicker for sharper corners (visual only,
+// drawn outside the road edge). Road width depends on the track (wide = easy,
+// narrow = expert).
 //
 // Screen layout: rows 0..kPlayH-1 are the playable/road area; the bottom
 // kHudH rows are one dedicated HUD strip (LAP | SPEED | TIME). World
@@ -161,6 +164,8 @@ constexpr int      kZoneTurn      = 36;         // brads (~50 deg): minimum tota
 constexpr int      kZoneRunUp     = 5;          // points of road needed between the previous corner's exit and a zone corner
 constexpr int      kZoneMaxVSafe  = 140;        // px/s: only corners that really slow a grip car deserve a zone
 constexpr int      kZoneLines     = 3;          // max dotted lines per zone (every 2nd point, starting 1 point before entry)
+constexpr uint8_t  kKerbPeak[3]   = { 2, 4, 6 };  // kerb thickness (px beyond the road edge line) at the apex: gentle / medium / sharp
+constexpr uint8_t  kKerbBase[3]   = { 1, 2, 2 };  // thickness of the long lead-in section before the corner
 constexpr float    kHudLookS      = 0.9f;       // s of travel the HUD corner indicator looks ahead
 constexpr float    kHudLookMin    = 90.f;       // px
 constexpr float    kHudLookMax    = 220.f;      // px
@@ -280,6 +285,12 @@ int     gCorN;
 // bit 3 drift-zone line
 uint8_t gMark[kTrackMax];
 int8_t  gNextCor[kTrackMax];    // index of the next corner whose entry lies ahead of this point
+// per-point kerb thickness (px beyond the road edge line), one array per edge. A corner's kerb sits on the
+// edge the bend turns toward: a long thin lead-in (visible well before the corner), then it builds up to a
+// bulge at the apex and fades out at the exit. Two arrays so an S-bend can carry both edges at once.
+// Visual only: the drivable width and the wall limit never look at these.
+uint8_t gKerbL[kTrackMax];
+uint8_t gKerbR[kTrackMax];
 
 
 float trackRadius(const TrackDef& T, float t) {
@@ -299,7 +310,7 @@ inline int absi(int v) { return v < 0 ? -v : v; }
 
 void analyseCorners() {
   gCorN = 0;
-  for (int i = 0; i < gN; ++i) { gMark[i] = 0; gNextCor[i] = -1; }
+  for (int i = 0; i < gN; ++i) { gMark[i] = 0; gNextCor[i] = -1; gKerbL[i] = 0; gKerbR[i] = 0; }
   int s0 = 0, bq = 1000;                         // start the scan on the quietest point (never mid-corner)
   for (int i = 0; i < gN; ++i) { const int q = absi(gTCur[i]); if (q < bq) { bq = q; s0 = i; } }
 
@@ -333,6 +344,43 @@ void analyseCorners() {
     i = j;
   }
   // corners were found in scan order; entries wrap once around the loop
+
+  // ---- kerbs: lead-in (as long as the corner itself => total length 2x) -> build-up -> bulge at the apex -> fade ----
+  for (int ci = 0; ci < gCorN; ++ci) {
+    const Corner& c = gCor[ci];
+    const int span = ((int)c.exit - (int)c.entry + gN) % gN;
+    const int pa   = ((int)c.apex - (int)c.entry + gN) % gN;
+    int room = gN / 2;                                   // never reach back past the previous corner's apex
+    for (int o = 0; o < gCorN; ++o) {
+      if (o == ci) continue;
+      const int d = ((int)c.entry - (int)gCor[o].apex + gN) % gN;
+      if (d > 0 && d < room) room = d;
+    }
+    int lead = span;
+    if (lead > room - 1) lead = room - 1;
+    if (lead < 0) lead = 0;
+    const float peak = (float)kKerbPeak[c.sev], base = (float)kKerbBase[c.sev];
+    for (int u = -lead; u <= span; ++u) {
+      float e;
+      if (u < 0) {                                       // lead-in: short fade-in, then a steady thin kerb
+        float f = (float)(u + lead) * 0.5f; if (f > 1.f) f = 1.f;
+        e = base * f;
+      } else if (u <= pa) {                              // build-up toward the apex
+        float r = (pa > 0) ? (float)u / (float)pa : 1.f;
+        r = r * r * (3.f - 2.f * r);
+        e = base + (peak - base) * r;
+      } else {                                           // fade out toward the exit
+        float r = (span > pa) ? (float)(span - u) / (float)(span - pa) : 0.f;
+        r = r * r * (3.f - 2.f * r);
+        e = peak * r;
+      }
+      const uint8_t lvl = (uint8_t)(e + 0.5f);
+      if (lvl == 0) continue;
+      const int idx = (((int)c.entry + u) % gN + gN) % gN;
+      uint8_t& dst = (c.dir > 0) ? gKerbL[idx] : gKerbR[idx];
+      if (lvl > dst) dst = lvl;
+    }
+  }
 
   // ---- road marks ----
   for (int ci = 0; ci < gCorN; ++ci) {
@@ -1388,6 +1436,29 @@ void renderWorld(U8G2& d) {
     seg(d, fx[k - 1], fy[k - 1], fx[k], fy[k]);
     seg(d, (int16_t)(fx[k - 1] - ox[k - 1]), (int16_t)(fy[k - 1] - oy[k - 1]),
            (int16_t)(fx[k] - ox[k]),         (int16_t)(fy[k] - oy[k]));
+    // kerb: a bordered, striped band OUTSIDE the road edge on the side the bend turns toward. The border is a
+    // solid line at the outer limit (it follows the thickness, so it tapers as the kerb fades in and out);
+    // inside it the stripe lines are drawn in short on/off pieces. Purely visual: the drivable width and the
+    // wall limit are untouched.
+    for (int sideLeft = 1; sideLeft >= 0; --sideLeft) {
+      const uint8_t* kb = sideLeft ? gKerbL : gKerbR;
+      const int ea = kb[ti[k - 1]], eb = kb[ti[k]];
+      if (ea == 0 && eb == 0) continue;
+      const int16_t* bxp = sideLeft ? ex : fx;
+      const int16_t* byp = sideLeft ? ey : fy;
+      const int sg = sideLeft ? 1 : -1;
+      // border (t = 1 is the existing outer edge pixel line, so thickness E puts the border at t = 1 + E)
+      seg(d, (int16_t)(bxp[k - 1] + sg * (1 + ea) * ox[k - 1]), (int16_t)(byp[k - 1] + sg * (1 + ea) * oy[k - 1]),
+             (int16_t)(bxp[k] + sg * (1 + eb) * ox[k]),         (int16_t)(byp[k] + sg * (1 + eb) * oy[k]));
+      const int m = (ea < eb) ? ea : eb;
+      for (int t = 2; t <= m; ++t) {                       // stripes between the road edge and the border
+        const int16_t x0 = (int16_t)(bxp[k - 1] + sg * t * ox[k - 1]), y0 = (int16_t)(byp[k - 1] + sg * t * oy[k - 1]);
+        const int16_t x1 = (int16_t)(bxp[k] + sg * t * ox[k]),         y1 = (int16_t)(byp[k] + sg * t * oy[k]);
+        const int16_t dx = (int16_t)(x1 - x0), dy = (int16_t)(y1 - y0);
+        seg(d, x0, y0, (int16_t)(x0 + dx / 4), (int16_t)(y0 + dy / 4));
+        seg(d, (int16_t)(x0 + dx / 2), (int16_t)(y0 + dy / 2), (int16_t)(x0 + (dx * 3) / 4), (int16_t)(y0 + (dy * 3) / 4));
+      }
+    }
     // centre dashes (6 points on / 6 off), left out around a corner arrow so the arrow reads cleanly
     const uint8_t mk = gMark[i];
     if ((i % 12) < 6 && !(mk & 3) && !(gMark[ti[k - 1]] & 3)) seg(d, mx[k - 1], my[k - 1], mx[k], my[k]);
@@ -1410,8 +1481,14 @@ void renderWorld(U8G2& d) {
     if (i % 22 == 11) {
       const bool left = ((i / 22) & 1) == 0;
       const int16_t bx = left ? ex[k] : fx[k], by = left ? ey[k] : fy[k];
-      const int16_t txx = (int16_t)(mx[k] + (int16_t)(((bx - mx[k]) * 19) / 16));
-      const int16_t tyy = (int16_t)(my[k] + (int16_t)(((by - my[k]) * 19) / 16));
+      int16_t txx = (int16_t)(mx[k] + (int16_t)(((bx - mx[k]) * 19) / 16));
+      int16_t tyy = (int16_t)(my[k] + (int16_t)(((by - my[k]) * 19) / 16));
+      const int kbt = left ? gKerbL[i] : gKerbR[i];      // keep trees clear of a kerb on their side
+      if (kbt > 0) {
+        const int push = 2 + kbt;
+        txx = (int16_t)(txx + (left ? push * ox[k] : -push * ox[k]));
+        tyy = (int16_t)(tyy + (left ? push * oy[k] : -push * oy[k]));
+      }
       if (txx >= 2 && txx <= (int16_t)(fb::SCREEN_W - 3) && tyy >= 2 && tyy <= (int16_t)(kPlayH - 3))
         d.drawCircle((u8g2_uint_t)txx, (u8g2_uint_t)tyy, 2);
     }
